@@ -316,7 +316,41 @@ func (v *Resolver) resolve(rcount int, addr string, tr *trace.Trace) ([]Recipien
 	}
 
 	tr.Debugf("%d| returning %v", rcount, ret)
-	return ret, nil
+	return deduplicateRecipients(ret), nil
+}
+
+// deduplicateRecipients removes duplicate recipients from the list,
+// preserving order of first appearance.
+//
+// Two recipients are considered duplicates if they have the same Type, Addr,
+// and Via (for FORWARDs). This ensures that the same destination is not
+// delivered to more than once, while still preserving distinct delivery
+// paths (e.g. the same address forwarded via different servers).
+func deduplicateRecipients(rcpts []Recipient) []Recipient {
+	if len(rcpts) <= 1 {
+		return rcpts
+	}
+
+	type key struct {
+		addr string
+		via  string
+		typ  RType
+	}
+
+	seen := make(map[key]bool, len(rcpts))
+	result := make([]Recipient, 0, len(rcpts))
+	for _, r := range rcpts {
+		k := key{
+			addr: r.Addr,
+			via:  strings.Join(r.Via, "/"),
+			typ:  r.Type,
+		}
+		if !seen[k] {
+			seen[k] = true
+			result = append(result, r)
+		}
+	}
+	return result
 }
 
 // Remove drop characters, but only up to the first suffix separator.

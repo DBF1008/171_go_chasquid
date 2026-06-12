@@ -852,6 +852,312 @@ func TestParseForward(t *testing.T) {
 	}
 }
 
+// TestDeduplication verifies that alias expansion does not produce duplicate
+// recipients, even when multiple sources (alias file, catch-all, resolve hook,
+// recursive expansion) converge on the same final addresses.
+//
+// It covers:
+//   - Normal aliases: recursive expansion converging on the same address.
+//   - Catch-all + hook: both returning the same recipient.
+//   - Hook + alias overlap: hook returning the same address as the alias file.
+//   - Mixed types: FORWARD and EMAIL to the same address are preserved.
+//   - Same forward via different servers: both paths are preserved.
+//   - Same forward via same servers: deduplicated.
+func TestDeduplication(t *testing.T) {
+	// --- 1. Recursive expansion convergence (no hooks). ---
+	// Two alias branches resolve to the same final recipient.
+	t.Run("recursive-convergence", func(t *testing.T) {
+		resolver := NewResolver(allUsersExist)
+		resolver.AddDomain("dom")
+		resolver.aliases = map[string][]Recipient{
+			"a@dom": {email("b@dom"), email("c@dom")},
+			"b@dom": {email("final@remote")},
+			"c@dom": {email("final@remote")},
+		}
+
+		Cases{
+			{"a@dom", []Recipient{email("final@remote")}, nil},
+		}.check(t, resolver)
+	})
+
+	// --- 2. Direct duplicate in alias RHS. ---
+	// An alias that lists the same recipient twice.
+	t.Run("direct-duplicate-in-alias", func(t *testing.T) {
+		resolver := NewResolver(allUsersExist)
+		resolver.AddDomain("dom")
+		resolver.aliases = map[string][]Recipient{
+			"a@dom": {email("b@remote"), email("b@remote")},
+		}
+
+		Cases{
+			{"a@dom", []Recipient{email("b@remote")}, nil},
+		}.check(t, resolver)
+	})
+
+	// --- 3. Catch-all + hook overlap. ---
+	// Catch-all alias and hook both return the same address.
+	t.Run("catchall-hook-overlap", func(t *testing.T) {
+		resolver := NewResolver(noUsersExist)
+		resolver.AddDomain("dom")
+		resolver.aliases = map[string][]Recipient{
+			"*@dom": {email("catch@remote")},
+		}
+		resolver.ResolveHook = "testdata/catchall-hook.sh"
+
+		// x@dom has no alias, no user → catch-all fires.
+		// lookup("*@dom") = alias[c catch@remote] + hook[catch@remote] → dedup.
+		Cases{
+			{"x@dom", []Recipient{email("catch@remote")}, nil},
+		}.check(t, resolver)
+	})
+
+	// --- 4. Alias + hook overlap. ---
+	// Alias file entry and hook return the same recipient.
+	t.Run("alias-hook-overlap", func(t *testing.T) {
+		resolver := NewResolver(allUsersExist)
+		resolver.AddDomain("dom")
+		resolver.aliases = map[string][]Recipient{
+			"a@dom": {email("c@d")},
+		}
+		resolver.ResolveHook = "testdata/dup-hook.sh"
+
+		// lookup("a@dom") = alias[c@d] + hook[c@d] → dedup.
+		Cases{
+			{"a@dom", []Recipient{email("c@d")}, nil},
+		}.check(t, resolver)
+	})
+
+	// --- 5. Mixed types preserved (EMAIL vs FORWARD to same address). ---
+	t.Run("mixed-types-preserved", func(t *testing.T) {
+		resolver := NewResolver(allUsersExist)
+		resolver.AddDomain("dom")
+		resolver.aliases = map[string][]Recipient{
+			"a@dom": {
+				email("x@remote"),
+				forward("x@remote", []string{"server1"}),
+			},
+		}
+
+		// EMAIL and FORWARD are different types → both kept.
+		Cases{
+			{"a@dom", []Recipient{
+				email("x@remote"),
+				forward("x@remote", []string{"server1"}),
+			}, nil},
+		}.check(t, resolver)
+	})
+
+	// --- 6. Same FORWARD via different servers → both kept. ---
+	t.Run("forward-different-servers", func(t *testing.T) {
+		resolver := NewResolver(allUsersExist)
+		resolver.AddDomain("dom")
+		resolver.aliases = map[string][]Recipient{
+			"a@dom": {
+				forward("x@remote", []string{"s1"}),
+				forward("x@remote", []string{"s2"}),
+			},
+		}
+
+		Cases{
+			{"a@dom", []Recipient{
+				forward("x@remote", []string{"s1"}),
+				forward("x@remote", []string{"s2"}),
+			}, nil},
+		}.check(t, resolver)
+	})
+
+	// --- 7. Same FORWARD via same servers → deduplicated. ---
+	t.Run("forward-same-servers-dedup", func(t *testing.T) {
+		resolver := NewResolver(allUsersExist)
+		resolver.AddDomain("dom")
+		resolver.aliases = map[string][]Recipient{
+			"a@dom": {
+				forward("x@remote", []string{"s1", "s2"}),
+				forward("x@remote", []string{"s1", "s2"}),
+			},
+		}
+
+		Cases{
+			{"a@dom", []Recipient{
+				forward("x@remote", []string{"s1", "s2"}),
+			}, nil},
+		}.check(t, resolver)
+	})
+
+	// --- 8. PIPE deduplication. ---
+	t.Run("pipe-dedup", func(t *testing.T) {
+		resolver := NewResolver(allUsersExist)
+		resolver.AddDomain("dom")
+		resolver.aliases = map[string][]Recipient{
+			"a@dom": {pipe("cmd arg1"), pipe("cmd arg1")},
+		}
+
+		Cases{
+			{"a@dom", []Recipient{pipe("cmd arg1")}, nil},
+		}.check(t, resolver)
+	})
+
+	// --- 9. Mixed scenario: alias + hook + forward + catch-all. ---
+	// Complex scenario combining multiple sources of recipients.
+	t.Run("mixed-scenario", func(t *testing.T) {
+		resolver := NewResolver(allUsersExist)
+		resolver.AddDomain("dom")
+		resolver.aliases = map[string][]Recipient{
+			"a@dom": {
+				email("shared@remote"),
+				email("unique-alias@remote"),
+				forward("shared@remote", []string{"srv"}),
+			},
+		}
+		// Hook returns "shared@remote" (overlaps with alias) and
+		// "hook-only@remote" (unique).
+		resolver.ResolveHook = "testdata/mixed-hook.sh"
+
+		// "shared@remote" appears in both alias and hook → deduplicated.
+		// FORWARD "shared@remote via srv" is a different type → kept.
+		// "hook-only@remote" is unique to the hook → kept.
+		Cases{
+			{"a@dom", []Recipient{
+				email("shared@remote"),
+				email("unique-alias@remote"),
+				forward("shared@remote", []string{"srv"}),
+				email("hook-only@remote"),
+			}, nil},
+		}.check(t, resolver)
+	})
+
+	// --- 10. Catch-all with right-side asterisk + hook coexistence. ---
+	// Catch-all uses "*@remote" (asterisk rewrite) while the hook returns
+	// a fixed address. They produce different results, so both are kept.
+	t.Run("catchall-asterisk-hook-coexist", func(t *testing.T) {
+		resolver := NewResolver(noUsersExist)
+		resolver.AddDomain("dom")
+		resolver.aliases = map[string][]Recipient{
+			// Catch-all that rewrites to a remote domain using the original user.
+			"*@dom": {email("*@remote")},
+		}
+		// Hook only fires for "*@dom" lookups (returns "catch@remote").
+		// For "x@dom" lookup, the hook returns nothing.
+		// So: lookup("x@dom") → empty → catch-all: lookup("*@dom")
+		//   = alias[*@remote] + hook[catch@remote]
+		// *@remote → replaced with x@remote; catch@remote → as-is.
+		resolver.ResolveHook = "testdata/catchall-hook.sh"
+
+		Cases{
+			{"x@dom", []Recipient{
+				email("x@remote"),
+				email("catch@remote"),
+			}, nil},
+		}.check(t, resolver)
+	})
+
+	// --- 11. Empty result stays empty. ---
+	t.Run("empty", func(t *testing.T) {
+		resolver := NewResolver(noUsersExist)
+		resolver.AddDomain("dom")
+
+		// Non-local address returns as-is (single element, no dedup needed).
+		Cases{
+			{"x@remote", []Recipient{email("x@remote")}, nil},
+		}.check(t, resolver)
+	})
+}
+
+// TestDeduplicateRecipients is a unit test for the deduplicateRecipients function.
+func TestDeduplicateRecipients(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []Recipient
+		want []Recipient
+	}{
+		{
+			name: "nil",
+			in:   nil,
+			want: nil,
+		},
+		{
+			name: "empty",
+			in:   []Recipient{},
+			want: []Recipient{},
+		},
+		{
+			name: "single",
+			in:   []Recipient{email("a@b")},
+			want: []Recipient{email("a@b")},
+		},
+		{
+			name: "no-dups",
+			in:   []Recipient{email("a@b"), email("c@d")},
+			want: []Recipient{email("a@b"), email("c@d")},
+		},
+		{
+			name: "email-dups",
+			in:   []Recipient{email("a@b"), email("c@d"), email("a@b")},
+			want: []Recipient{email("a@b"), email("c@d")},
+		},
+		{
+			name: "pipe-dups",
+			in:   []Recipient{pipe("cmd"), pipe("cmd")},
+			want: []Recipient{pipe("cmd")},
+		},
+		{
+			name: "forward-dups-same-via",
+			in: []Recipient{
+				forward("a@b", []string{"s1"}),
+				forward("a@b", []string{"s1"}),
+			},
+			want: []Recipient{forward("a@b", []string{"s1"})},
+		},
+		{
+			name: "forward-different-via",
+			in: []Recipient{
+				forward("a@b", []string{"s1"}),
+				forward("a@b", []string{"s2"}),
+			},
+			want: []Recipient{
+				forward("a@b", []string{"s1"}),
+				forward("a@b", []string{"s2"}),
+			},
+		},
+		{
+			name: "email-vs-forward",
+			in: []Recipient{
+				email("a@b"),
+				forward("a@b", []string{"s1"}),
+			},
+			want: []Recipient{
+				email("a@b"),
+				forward("a@b", []string{"s1"}),
+			},
+		},
+		{
+			name: "preserves-order",
+			in: []Recipient{
+				email("c@d"),
+				email("a@b"),
+				email("c@d"),
+				email("e@f"),
+				email("a@b"),
+			},
+			want: []Recipient{
+				email("c@d"),
+				email("a@b"),
+				email("e@f"),
+			},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := deduplicateRecipients(c.in)
+			if !reflect.DeepEqual(got, c.want) {
+				t.Errorf("deduplicateRecipients(%+v):\n  got  %+v\n  want %+v",
+					c.in, got, c.want)
+			}
+		})
+	}
+}
+
 // Fuzz testing for the parser.
 func FuzzReader(f *testing.F) {
 	resolver := NewResolver(allUsersExist)
