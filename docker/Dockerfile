@@ -1,0 +1,93 @@
+# Docker file for creating a container that will run chasquid and Dovecot.
+#
+# THIS IS EXPERIMENTAL AND LIKELY TO CHANGE.
+#
+# This is not recommended for serious installations, you're probably better
+# off following the documentation and setting the server up manually.
+#
+# See the README.md file for more details.
+
+# Build the binaries.
+FROM golang:latest AS build
+WORKDIR /go/src/blitiri.com.ar/go/chasquid
+COPY . .
+RUN go install ./...
+
+# Create the image.
+# Use a specific Debian stable version, because the move between
+# different stable version may introduce some breaking changes, so we want to
+# do them in a controlled way.
+FROM debian:13-slim
+
+# Create the chasquid and dovecot users with fixed UID/GID.
+# Install the packages we need.
+# This includes chasquid, which sets up good defaults.
+# Make debconf/frontend non-interactive, to avoid distracting output about the
+# lack of $TERM.
+RUN \
+	groupadd -g 101 chasquid && \
+	useradd -m -u 100 -g 101 -s /usr/sbin/nologin -d /var/lib/chasquid \
+		chasquid && \
+	groupadd -g 103 dovecot && \
+	useradd -m -u 101 -g 103 -s /usr/sbin/nologin -d /usr/lib/dovecot \
+		dovecot && \
+	DEBIAN_FRONTEND=noninteractive apt-get update -q && \
+	apt-get install -y -q \
+		chasquid \
+		dovecot-lmtpd dovecot-imapd dovecot-pop3d \
+		dovecot-sieve dovecot-managesieved \
+		supervisor \
+		acl libcap2-bin certbot && \
+	apt-get autoremove --purge -y -q && \
+	apt-get autoclean -y -q && \
+	rm -rf /var/lib/apt/lists/*
+
+# Copy the binaries. This overrides the debian packages with the ones we just
+# built above.
+COPY --from=build /go/bin/chasquid /go/bin/chasquid-util /go/bin/smtp-check /go/bin/mda-lmtp /usr/bin/
+
+# Let chasquid bind privileged ports, so we can run it as its own user.
+RUN setcap CAP_NET_BIND_SERVICE=+eip /usr/bin/chasquid
+
+# Copy docker-specific configurations.
+COPY docker/dovecot.conf /etc/dovecot/dovecot.conf
+COPY docker/chasquid.conf /etc/chasquid/chasquid.conf
+COPY docker/supervisord.conf /etc/supervisor/supervisord.conf
+
+# Copy utility scripts.
+COPY docker/add-user.sh docker/entrypoint.sh /
+
+# chasquid: SMTP, submission, submission+tls.
+EXPOSE 25 465 587
+
+# dovecot: POP3s, IMAPs, managesieve.
+EXPOSE 993 995 4190
+
+# http for letsencrypt/certbot.
+EXPOSE 80 443
+
+# Store emails and chasquid databases in an external volume, to be mounted at
+# /data, so they're independent from the image itself.
+VOLUME /data
+
+# Put some directories where we expect persistent user data into /data.
+# Give the chasquid user access to the necessary configuration.
+RUN rmdir /etc/chasquid/domains/ && \
+	ln -sf /data/chasquid/domains/ /etc/chasquid/domains && \
+	rm -rf /etc/letsencrypt/ && \
+	ln -sf /data/letsencrypt/ /etc/letsencrypt && \
+	setfacl -R -m u:chasquid:rX /etc/chasquid/ && \
+	mv /etc/chasquid/certs/ /etc/chasquid/certs-orig && \
+	ln -s /etc/letsencrypt/live/ /etc/chasquid/certs
+
+
+# NOTE: Set AUTO_CERTS="example.com example.org" to automatically obtain and
+# renew certificates upon startup, via Letsencrypt. You're agreeing to their
+# ToS by setting this variable, so please review them carefully.
+# CERTS_EMAIL should be set to your email address so letsencrypt can send you
+# critical notifications.
+ENV AUTO_CERTS=""
+
+# Custom entry point that does some configuration checks and ensures
+# letsencrypt is properly set up.
+ENTRYPOINT ["/entrypoint.sh"]

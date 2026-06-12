@@ -1,0 +1,12 @@
+# Prometheus configuration file for testing chasquid metrics.
+
+global:
+  # Reduce intervals to speed up the tests.
+  scrape_interval: 100ms
+  scrape_timeout: 100ms
+  evaluation_interval: 100ms
+
+scrape_configs:
+  - job_name: 'chasquid'
+    static_configs:
+      - targets: ['localhost:1099']

@@ -1,0 +1,118 @@
+
+syntax = "proto3";
+option go_package = "blitiri.com.ar/go/chasquid/internal/config";
+
+message Config {
+	// Default hostname to use when saying hello.
+	// This is used:
+	// 1) To say hello to clients, for aesthetic purposes.
+	// 2) As the HELO/EHLO domain on outgoing SMTP connections, so ideally
+	//    it would resolve back to the server. In practice, it's not a big
+	//    deal if it isn't, but it makes troubleshooting easier.
+	// Default: the system's hostname.
+	string hostname = 1;
+
+	// Maximum email size, in megabytes.
+	// Default: 50.
+	int64 max_data_size_mb = 2;
+
+	// Addresses to listen on for SMTP (usually port 25).
+	// Default: "systemd", which means systemd passes sockets to us.
+	// systemd sockets must be named with "FileDescriptorName=smtp".
+	repeated string smtp_address = 3;
+
+	// Addresses to listen on for submission (usually port 587).
+	// Default: "systemd", which means systemd passes sockets to us.
+	// systemd sockets must be named with "FileDescriptorName=submission".
+	repeated string submission_address = 4;
+
+	// Addresses to listen on for submission-over-TLS (usually port 465).
+	// Default: "systemd", which means systemd passes sockets to us.
+	// systemd sockets must be named with
+	// "FileDescriptorName=submission_tls".
+	repeated string submission_over_tls_address = 5;
+
+	// Address for the monitoring http server.
+	// Do NOT expose this to the public internet.
+	// Default: no monitoring http server.
+	string monitoring_address = 6;
+
+	// Mail delivery agent (MDA, also known as LDA) to use.
+	// This should point to the binary to use to deliver email to local
+	// users. The content of the email will be passed via stdin. If it exits
+	// unsuccessfully, we assume the mail was not delivered.
+	// Default: "maildrop".
+	string mail_delivery_agent_bin = 7;
+
+	// Command line arguments for the mail delivery agent. One per argument.
+	// Some replacements will be done.
+	// On an email sent from marsnik@mars to venera@venus:
+	//  - %from%        -> from address (marsnik@mars)
+	//  - %from_user%   -> from user (marsnik)
+	//  - %from_domain% -> from domain (mars)
+	//  - %to%        -> to address (venera@venus)
+	//  - %to_user%   -> to user (venera)
+	//  - %to_domain% -> to domain (venus)
+	//
+	// Default: "-f", "%from%", "-d", "%to_user%"  (adequate for procmail
+	// and maildrop).
+	repeated string mail_delivery_agent_args = 8;
+
+	// Directory where we store our persistent data.
+	// Default: "/var/lib/chasquid"
+	string data_dir = 9;
+
+	// Suffix separator, to perform suffix removal of local users.
+	// For example, if you set this to "-+", email to local user
+	// "user-blah" and "user+blah" will be delivered to "user".
+	// Including "+" is strongly encouraged, as it is assumed for email
+	// forwarding.
+	// Default: "+".
+	optional string suffix_separators = 10;
+
+	// Characters to drop from the user part on local emails.
+	// For example, if you set this to "._", email to local user
+	// "u.se_r" will be delivered to "user".
+	// Default: ".".
+	optional string drop_characters = 11;
+
+	// Path where to write the mail log to.
+	// If "<syslog>", log using the syslog (at MAIL|INFO priority).
+	// If "<stdout>", log to stdout; if "<stderr>", log to stderr.
+	// Default: <syslog>
+	string mail_log_path = 12;
+
+	// Enable dovecot authentication.
+	// Domains that don't have an user database will be authenticated via
+	// dovecot.
+	bool dovecot_auth = 13;
+
+	// Dovecot userdb path. If dovecot_auth is set and this
+	// is not, we will try to autodetect it.
+	// Example: /var/run/dovecot/auth-userdb
+	string dovecot_userdb_path = 14;
+
+	// Dovecot client path. If dovecot_auth is set and this
+	// is not, we will try to autodetect it.
+	// Example: /var/run/dovecot/auth-client
+	string dovecot_client_path = 15;
+
+	// Expect incoming SMTP connections to use the HAProxy protocol.
+	// This allows deploying chasquid behind a HAProxy server, as the
+	// address information is preserved.
+	bool haproxy_incoming = 16;
+
+	// Maximum number of items in the queue.
+	// If we have this many items in the queue, we reject new incoming
+	// email. Be careful when increasing this, as we keep all items in
+	// memory.
+	// Default: 200 (but may change in the future).
+	uint32 max_queue_items = 17;
+
+	// How long do we keep retrying sending an email before we give up.
+	// Once we give up, a DSN will be sent back to the sender.
+	// The format is a Go duration string (e.g. "48h" or "360m"; note days
+	// are not a supported unit).
+	// Default: "20h" (but may change in the future).
+	string give_up_send_after = 18;
+}

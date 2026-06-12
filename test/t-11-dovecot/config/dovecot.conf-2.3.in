@@ -1,0 +1,56 @@
+base_dir = $ROOT/run/
+state_dir = $ROOT/lib/
+log_path = $ROOT/dovecot.log
+ssl = no
+
+default_internal_user = $USER
+default_internal_group = $USER
+default_login_user = $USER
+
+# Before auth checks, rename "u@d" to "u-x". This exercises that chasquid
+# handles well the case where the returned user information does not match the
+# requested user.
+# We drop the domain, to exercise "naked" auth handling.
+auth_username_format = "%n-x"
+
+# Disable authentication penalty, since we intentionally make failed requests
+# and it just slows down tests.
+auth_failure_delay = 0
+
+passdb {
+	driver = passwd-file
+	args = $ROOT/passwd
+}
+
+userdb {
+	driver = passwd-file
+	args = $ROOT/passwd
+}
+
+service auth {
+	unix_listener auth {
+		mode = 0666
+	}
+}
+
+# Dovecot refuses to start without protocols, so we need to give it one.
+protocols = imap
+
+service imap-login {
+	chroot =
+	inet_listener imap {
+		address = 127.0.0.1
+		port = 0
+	}
+}
+
+service anvil {
+	chroot =
+}
+
+# Turn on debugging information, to help troubleshooting issues.
+auth_verbose = yes
+auth_debug = yes
+auth_debug_passwords = yes
+auth_verbose_passwords = yes
+mail_debug = yes

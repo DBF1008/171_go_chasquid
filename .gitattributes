@@ -1,0 +1,5 @@
+# Force Unix style line endings for files that will be copied into the Docker
+# image. This is helpful when using git on Windows, as it prevents the wrong
+# newlines to be copied inside the Docker image, which can cause scripts to
+# fail to run.
+docker/* text eol=lf

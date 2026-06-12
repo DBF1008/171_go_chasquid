@@ -1,0 +1,4 @@
+
+c = ./dovecot-auth-cli .missingsocket something else
+c <- no: unknown subcommand "something"
+c wait 0
