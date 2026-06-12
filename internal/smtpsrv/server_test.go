@@ -17,6 +17,7 @@ import (
 	"blitiri.com.ar/go/chasquid/internal/auth"
 	"blitiri.com.ar/go/chasquid/internal/domaininfo"
 	"blitiri.com.ar/go/chasquid/internal/maillog"
+	"blitiri.com.ar/go/chasquid/internal/queue"
 	"blitiri.com.ar/go/chasquid/internal/testlib"
 	"blitiri.com.ar/go/chasquid/internal/userdb"
 )
@@ -658,7 +659,7 @@ func realMain(m *testing.M) int {
 		s.AddAddr(submissionAddr, ModeSubmission)
 		s.AddAddr(submissionTLSAddr, ModeSubmissionTLS)
 
-		s.InitQueue(tmpDir+"/queue", localC, remoteC)
+		s.InitQueue(tmpDir+"/queue", localC, remoteC, 0, 0)
 
 		dinfo, err := domaininfo.New(tmpDir + "/domaininfo")
 		if err != nil {
@@ -690,6 +691,63 @@ func realMain(m *testing.M) int {
 	waitForServer(submissionAddr)
 	waitForServer(submissionTLSAddr)
 	return m.Run()
+}
+
+// TestInitQueueGiveUpAfterRecovery checks that InitQueue applies the configured
+// give-up time before it loads and starts delivering persisted items.
+//
+// Regression test: the queue used to be loaded (which launches the per-item
+// send loops) before the configured give-up time was applied, so recovered
+// items transiently ran with the built-in default. An item older than that
+// default would then be bounced prematurely instead of being delivered.
+func TestInitQueueGiveUpAfterRecovery(t *testing.T) {
+	dir := testlib.MustTempDir(t)
+	defer testlib.RemoveIfOk(t, dir)
+	queueDir := dir + "/queue"
+	if err := os.MkdirAll(queueDir, 0700); err != nil {
+		t.Fatalf("failed to create queue dir: %v", err)
+	}
+
+	// Persist an item older than the built-in default give-up time (20h), as if
+	// it had been sitting in the on-disk queue across a restart.
+	item := &queue.Item{
+		Message: queue.Message{
+			ID:   "recovered-item",
+			From: "from@localhost",
+			Rcpt: []*queue.Recipient{{
+				Address:         "to@remote",
+				Type:            queue.Recipient_EMAIL,
+				Status:          queue.Recipient_PENDING,
+				OriginalAddress: "to@remote",
+			}},
+			Data: []byte("data"),
+		},
+		CreatedAt: time.Now().Add(-25 * time.Hour),
+	}
+	if err := item.WriteTo(queueDir); err != nil {
+		t.Fatalf("failed to persist item: %v", err)
+	}
+
+	s := NewServer()
+	s.AddDomain("localhost")
+
+	localC := testlib.NewTestCourier()
+	remoteC := testlib.NewTestCourier()
+	remoteC.Expect(1)
+
+	// Configure a give-up time larger than the default; the recovered item
+	// (25h old) must therefore keep being delivered, not bounced.
+	s.InitQueue(queueDir, localC, remoteC, 0, 48*time.Hour)
+
+	remoteC.Wait()
+	if req := remoteC.ReqFor["to@remote"]; req == nil {
+		t.Error("recovered item was bounced instead of delivered: " +
+			"give-up time was not applied before loading the queue")
+	}
+	// No DSN should have been generated for the sender.
+	if req := localC.ReqFor["from@localhost"]; req != nil {
+		t.Errorf("unexpected premature DSN: %q", string(req.Data))
+	}
 }
 
 func TestMain(m *testing.M) {

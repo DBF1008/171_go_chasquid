@@ -141,8 +141,8 @@ func main() {
 		Dinfo:       dinfo,
 		STSCache:    stsCache,
 	}
-	s.InitQueue(conf.DataDir+"/queue", localC, remoteC)
-	s.SetQueueLimits(conf.MaxQueueItems, conf.GiveUpSendAfterDuration())
+	s.InitQueue(conf.DataDir+"/queue", localC, remoteC,
+		conf.MaxQueueItems, conf.GiveUpSendAfterDuration())
 
 	// Load the addresses and listeners.
 	systemdLs, err := systemd.Listeners()

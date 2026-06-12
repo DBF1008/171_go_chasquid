@@ -330,6 +330,104 @@ func TestSerialization(t *testing.T) {
 	}
 }
 
+// TestGiveUpAfterOnRecovery checks that items recovered from disk honor the
+// queue's configured give-up time, rather than silently falling back to the
+// built-in default. This is what keeps restart recovery consistent with
+// freshly received mail (and avoids premature bounces).
+func TestGiveUpAfterOnRecovery(t *testing.T) {
+	// A custom give-up time larger than the default must keep an aged item
+	// being delivered after recovery, instead of bouncing it.
+	t.Run("larger give-up keeps delivering", func(t *testing.T) {
+		dir := testlib.MustTempDir(t)
+		defer testlib.RemoveIfOk(t, dir)
+
+		// Persist an item older than the built-in default (20h), but well
+		// within the configured give-up time below.
+		item := &Item{
+			Message: Message{
+				ID:   <-newID,
+				From: "from@loco",
+				Rcpt: []*Recipient{
+					mkR("to@remote", Recipient_EMAIL, Recipient_PENDING, "", "to@remote")},
+				Data: []byte("data"),
+			},
+			CreatedAt: time.Now().Add(-25 * time.Hour),
+		}
+		if err := item.WriteTo(dir); err != nil {
+			t.Fatalf("failed to write item: %v", err)
+		}
+
+		localC := testlib.NewTestCourier()
+		remoteC := testlib.NewTestCourier()
+		q, _ := New(dir, set.NewString("loco"),
+			aliases.NewResolver(allUsersExist), localC, remoteC)
+
+		// Configure the give-up time *before* loading, as the daemon does.
+		q.GiveUpAfter = 48 * time.Hour
+
+		remoteC.Expect(1)
+		q.Load()
+		remoteC.Wait()
+
+		if req := remoteC.ReqFor["to@remote"]; req == nil {
+			t.Error("recovered item was not delivered to its recipient")
+		}
+		// No DSN should have been generated for the sender.
+		if req := localC.ReqFor["from@loco"]; req != nil {
+			t.Errorf("unexpected premature DSN: %q", string(req.Data))
+		}
+
+		testlib.WaitFor(func() bool { return q.Len() == 0 }, 2*time.Second)
+		if q.Len() != 0 {
+			t.Errorf("%d items not removed from queue after delivery", q.Len())
+		}
+	})
+
+	// A custom give-up time shorter than both the item's age and the default
+	// must result in a DSN on recovery.
+	t.Run("smaller give-up triggers DSN before default", func(t *testing.T) {
+		dir := testlib.MustTempDir(t)
+		defer testlib.RemoveIfOk(t, dir)
+
+		// The item is younger than the built-in default (20h), so with the
+		// default it would keep being retried; with the configured give-up
+		// time (4h) it is already expired.
+		item := &Item{
+			Message: Message{
+				ID:   <-newID,
+				From: "from@loco",
+				Rcpt: []*Recipient{
+					mkR("to@to", Recipient_EMAIL, Recipient_PENDING, "err", "to@to")},
+				Data: []byte("data"),
+			},
+			CreatedAt: time.Now().Add(-8 * time.Hour),
+		}
+		if err := item.WriteTo(dir); err != nil {
+			t.Fatalf("failed to write item: %v", err)
+		}
+
+		localC := testlib.NewTestCourier()
+		remoteC := testlib.NewTestCourier()
+		q, _ := New(dir, set.NewString("loco"),
+			aliases.NewResolver(allUsersExist), localC, remoteC)
+
+		q.GiveUpAfter = 4 * time.Hour
+
+		// The DSN is delivered locally to the sender.
+		localC.Expect(1)
+		q.Load()
+		localC.Wait()
+
+		req := localC.ReqFor["from@loco"]
+		if req == nil {
+			t.Fatal("missing DSN after recovery")
+		}
+		if req.From != "<>" || req.To != "from@loco" {
+			t.Errorf("wrong DSN: from=%q to=%q", req.From, req.To)
+		}
+	})
+}
+
 func mkR(a string, t Recipient_Type, s Recipient_Status, m, o string) *Recipient {
 	return &Recipient{
 		Address:            a,

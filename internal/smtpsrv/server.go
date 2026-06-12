@@ -16,6 +16,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	"blitiri.com.ar/go/chasquid/internal/aliases"
@@ -224,11 +225,35 @@ func (s *Server) SetDomainInfo(dinfo *domaininfo.DB) {
 	s.dinfo = dinfo
 }
 
-// InitQueue initializes the queue.
-func (s *Server) InitQueue(path string, localC, remoteC courier.Courier) {
+// debugQueueOnce guards the registration of the /debug/queue HTTP handler, so
+// InitQueue can be safely called more than once in a process (e.g. in tests)
+// without panicking on a duplicate handler registration.
+var debugQueueOnce sync.Once
+
+// InitQueue initializes the queue, applying the given limits before loading
+// any persisted items from disk.
+//
+// The limits (in particular giveUpAfter) MUST be applied before Load, because
+// Load launches the per-item send loops, and those loops use GiveUpAfter to
+// decide when to stop retrying and emit a DSN. If we loaded first and
+// configured the limits afterwards, recovered items would transiently run with
+// the built-in defaults instead of the configured value. That is both racy and
+// can cause premature bounces (e.g. when give_up_send_after is larger than the
+// default and an item is older than the default). Applying the limits first
+// makes recovered items and freshly received mail share identical semantics.
+func (s *Server) InitQueue(path string, localC, remoteC courier.Courier, maxItems uint32, giveUpAfter time.Duration) {
 	q, err := queue.New(path, s.localDomains, s.aliasesR, localC, remoteC)
 	if err != nil {
 		log.Fatalf("Error initializing queue: %v", err)
+	}
+
+	// queue.New sets safe non-zero defaults, so only override when a positive
+	// value is given.
+	if maxItems > 0 {
+		q.MaxItems = int(maxItems)
+	}
+	if giveUpAfter > 0 {
+		q.GiveUpAfter = giveUpAfter
 	}
 
 	err = q.Load()
@@ -237,19 +262,12 @@ func (s *Server) InitQueue(path string, localC, remoteC courier.Courier) {
 	}
 	s.queue = q
 
-	http.HandleFunc("/debug/queue",
-		func(w http.ResponseWriter, r *http.Request) {
-			_, _ = w.Write([]byte(q.DumpString()))
-		})
-}
-
-func (s *Server) SetQueueLimits(maxItems uint32, giveUpAfter time.Duration) {
-	if maxItems > 0 {
-		s.queue.MaxItems = int(maxItems)
-	}
-	if giveUpAfter > 0 {
-		s.queue.GiveUpAfter = giveUpAfter
-	}
+	debugQueueOnce.Do(func() {
+		http.HandleFunc("/debug/queue",
+			func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte(q.DumpString()))
+			})
+	})
 }
 
 func (s *Server) aliasResolveRPC(tr *trace.Trace, req url.Values) (url.Values, error) {
