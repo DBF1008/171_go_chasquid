@@ -68,6 +68,8 @@ chasquid\-util \- chasquid management tool
 .PP
 \&\fBchasquid-util\fR [\fIoptions\fR] user-remove \fIuser@domain\fR
 .PP
+\&\fBchasquid-util\fR [\fIoptions\fR] user-list \fIdomain\fR [\-\-receive_only] [\-\-prefix=\fIprefix\fR]
+.PP
 \&\fBchasquid-util\fR [\fIoptions\fR] authenticate \fIuser@domain\fR [\-\-password=\fIpassword\fR]
 .PP
 \&\fBchasquid-util\fR [\fIoptions\fR] check-userdb \fIdomain\fR
@@ -91,6 +93,14 @@ authenticate. This is useful when creating receive-only users.
 .IP "\fBuser-remove\fR \fIuser@domain\fR" 8
 .IX Item "user-remove user@domain"
 Remove the user from the domain.
+.IP "\fBuser-list\fR \fIdomain\fR [\-\-receive_only] [\-\-prefix=\fIprefix\fR]" 8
+.IX Item "user-list domain [--receive_only] [--prefix=prefix]"
+List the users in the domain, sorted by name. Receive-only users (see
+\&\fI\-\-receive_only\fR in \fBuser-add\fR) are marked as such in the output.
+.Sp
+If \fI\-\-receive_only\fR is given, only receive-only users are listed. If
+\&\fI\-\-prefix\fR is given, only users whose name starts with the given prefix are
+listed.
 .IP "\fBauthenticate\fR \fIuser@domain\fR [\-\-password=\fIpassword\fR]" 8
 .IX Item "authenticate user@domain [--password=password]"
 Check the user's password.

@@ -363,3 +363,77 @@ func TestExists(t *testing.T) {
 		t.Errorf("known (denied) user does not exist")
 	}
 }
+
+func TestUsers(t *testing.T) {
+	fname := mustCreateDB(t, "")
+	defer removeIfSuccessful(t, fname)
+	db := mustLoad(t, fname)
+
+	// Empty database: no users.
+	if got := db.Users(); len(got) != 0 {
+		t.Errorf("expected no users, got %v", got)
+	}
+
+	// Add users out of alphabetical order, including a denied (receive-only)
+	// one, to confirm the result is sorted regardless of insertion order.
+	if err := db.AddUser("zoe", "passwd"); err != nil {
+		t.Fatalf("failed to add zoe: %v", err)
+	}
+	if err := db.AddDeniedUser("amy"); err != nil {
+		t.Fatalf("failed to add amy: %v", err)
+	}
+	if err := db.AddUser("bob", "passwd"); err != nil {
+		t.Fatalf("failed to add bob: %v", err)
+	}
+
+	want := []string{"amy", "bob", "zoe"}
+	if got := db.Users(); !reflect.DeepEqual(got, want) {
+		t.Errorf("Users() = %v, want %v", got, want)
+	}
+
+	// The result must survive a write + reload unchanged.
+	if err := db.Write(); err != nil {
+		t.Fatalf("error writing database: %v", err)
+	}
+	db = mustLoad(t, fname)
+	if got := db.Users(); !reflect.DeepEqual(got, want) {
+		t.Errorf("after reload, Users() = %v, want %v", got, want)
+	}
+}
+
+func TestIsReceiveOnly(t *testing.T) {
+	fname := mustCreateDB(t, "")
+	defer removeIfSuccessful(t, fname)
+	db := mustLoad(t, fname)
+
+	// Unknown user is not receive-only.
+	if db.IsReceiveOnly("unknown") {
+		t.Errorf("unknown user reported as receive-only")
+	}
+
+	if err := db.AddUser("normal", "passwd"); err != nil {
+		t.Fatalf("error adding normal user: %v", err)
+	}
+	if err := db.AddDeniedUser("recvonly"); err != nil {
+		t.Fatalf("error adding receive-only user: %v", err)
+	}
+
+	if db.IsReceiveOnly("normal") {
+		t.Errorf("normal user reported as receive-only")
+	}
+	if !db.IsReceiveOnly("recvonly") {
+		t.Errorf("receive-only user not reported as receive-only")
+	}
+
+	// Still correct after a write + reload.
+	if err := db.Write(); err != nil {
+		t.Fatalf("error writing database: %v", err)
+	}
+	db = mustLoad(t, fname)
+	if db.IsReceiveOnly("normal") {
+		t.Errorf("after reload, normal user reported as receive-only")
+	}
+	if !db.IsReceiveOnly("recvonly") {
+		t.Errorf("after reload, receive-only user not reported as receive-only")
+	}
+}

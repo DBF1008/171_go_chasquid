@@ -9,6 +9,8 @@ B<chasquid-util> [I<options>] user-add I<user@domain> [--password=I<password>] [
 
 B<chasquid-util> [I<options>] user-remove I<user@domain>
 
+B<chasquid-util> [I<options>] user-list I<domain> [--receive_only] [--prefix=I<prefix>]
+
 B<chasquid-util> [I<options>] authenticate I<user@domain> [--password=I<password>]
 
 B<chasquid-util> [I<options>] check-userdb I<domain>
@@ -38,6 +40,15 @@ authenticate. This is useful when creating receive-only users.
 =item B<user-remove> I<user@domain>
 
 Remove the user from the domain.
+
+=item B<user-list> I<domain> [--receive_only] [--prefix=I<prefix>]
+
+List the users in the domain, sorted by name. Receive-only users (see
+I<--receive_only> in B<user-add>) are marked as such in the output.
+
+If I<--receive_only> is given, only receive-only users are listed. If
+I<--prefix> is given, only users whose name starts with the given prefix are
+listed.
 
 =item B<authenticate> I<user@domain> [--password=I<password>]
 

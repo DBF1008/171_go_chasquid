@@ -1,0 +1,74 @@
+# Tests for the user-list command.
+# Start from a clean slate: remove any leftover databases for the domains we
+# use, so we neither depend on nor interfere with other tests.
+c = rm -rf .config/domains/domain .config/domains/nodomain
+c wait 0
+
+# Invalid domain: there is no userdb file, so listing must fail clearly rather
+# than printing an empty list (which would hide the misconfiguration).
+c = ./chasquid-util -C=.config user-list nodomain
+c <~ Error: file .* does not exist
+c wait 1
+
+# Missing domain argument.
+c = ./chasquid-util -C=.config user-list
+c <- Domain missing, the syntax is 'user-list <domain>'
+c wait 1
+
+# Add users out of alphabetical order, mixing in a receive-only user, to
+# confirm the output is sorted and the receive-only status is shown.
+c = ./chasquid-util -C=.config user-add bob@domain --password=passwd
+c <- Added user
+c wait 0
+
+c = ./chasquid-util -C=.config user-add alice@domain --receive_only
+c <- Added user
+c wait 0
+
+c = ./chasquid-util -C=.config user-add carol@domain --password=passwd
+c <- Added user
+c wait 0
+
+# Full listing: sorted, with the receive-only marker.
+c = ./chasquid-util -C=.config user-list domain
+c <- alice@domain (receive-only)
+c <- bob@domain
+c <- carol@domain
+c wait 0
+
+# Prefix filter (matches the local part).
+c = ./chasquid-util -C=.config user-list domain --prefix=ca
+c <- carol@domain
+c wait 0
+
+c = ./chasquid-util -C=.config user-list domain --prefix=a
+c <- alice@domain (receive-only)
+c wait 0
+
+# Receive-only filter.
+c = ./chasquid-util -C=.config user-list domain --receive_only
+c <- alice@domain (receive-only)
+c wait 0
+
+# Re-query after a write: removing a user must be reflected immediately.
+c = ./chasquid-util -C=.config user-remove bob@domain
+c <- Removed user
+c wait 0
+
+c = ./chasquid-util -C=.config user-list domain
+c <- alice@domain (receive-only)
+c <- carol@domain
+c wait 0
+
+# Empty database: remove the remaining users. The users file still exists but
+# has no entries, so listing must succeed with no output.
+c = ./chasquid-util -C=.config user-remove alice@domain
+c <- Removed user
+c wait 0
+
+c = ./chasquid-util -C=.config user-remove carol@domain
+c <- Removed user
+c wait 0
+
+c = ./chasquid-util -C=.config user-list domain
+c wait 0

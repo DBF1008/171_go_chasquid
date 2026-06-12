@@ -34,6 +34,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"sync"
 
 	"golang.org/x/crypto/scrypt"
@@ -212,6 +213,36 @@ func (db *DB) Len() int {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	return len(db.db.Users)
+}
+
+// Users returns the names of all users in the database, sorted
+// alphabetically. The names are the local part of the address (the part
+// before the "@"), as stored in the database.
+func (db *DB) Users() []string {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	names := make([]string, 0, len(db.db.Users))
+	for name := range db.db.Users {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// IsReceiveOnly returns true if the named user exists and is receive-only,
+// meaning it can receive mail but will never successfully authenticate. These
+// are the users added via AddDeniedUser.
+func (db *DB) IsReceiveOnly(name string) bool {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	p, ok := db.db.Users[name]
+	if !ok {
+		return false
+	}
+	_, denied := p.Scheme.(*Password_Denied)
+	return denied
 }
 
 ///////////////////////////////////////////////////////////

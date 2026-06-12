@@ -8,6 +8,8 @@ chasquid-util - chasquid management tool
 
 **chasquid-util** \[_options_\] user-remove _user@domain_
 
+**chasquid-util** \[_options_\] user-list _domain_ \[--receive\_only\] \[--prefix=_prefix_\]
+
 **chasquid-util** \[_options_\] authenticate _user@domain_ \[--password=_password_\]
 
 **chasquid-util** \[_options_\] check-userdb _domain_
@@ -34,6 +36,15 @@ chasquid-util is a command-line utility for [chasquid(1)](chasquid.1.md) operati
 - **user-remove** _user@domain_
 
     Remove the user from the domain.
+
+- **user-list** _domain_ \[--receive\_only\] \[--prefix=_prefix_\]
+
+    List the users in the domain, sorted by name. Receive-only users (see
+    _--receive\_only_ in **user-add**) are marked as such in the output.
+
+    If _--receive\_only_ is given, only receive-only users are listed. If
+    _--prefix_ is given, only users whose name starts with the given prefix are
+    listed.
 
 - **authenticate** _user@domain_ \[--password=_password_\]
 

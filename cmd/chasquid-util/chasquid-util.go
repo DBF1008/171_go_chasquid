@@ -30,6 +30,10 @@ Usage:
     Add a user to the userdb.
   chasquid-util [options] user-remove <user@domain>
     Remove a user from the userdb.
+  chasquid-util [options] user-list <domain> [--receive_only] [--prefix=<prefix>]
+    List the users in the domain's userdb, sorted. Receive-only users are
+    marked as such. Use --receive_only to list only receive-only users, and
+    --prefix to list only users whose name starts with the given prefix.
   chasquid-util [options] authenticate <user@domain> [--password=<password>]
     Authenticate a user.
   chasquid-util [options] check-userdb <domain>
@@ -88,6 +92,7 @@ func main() {
 	commands := map[string]func(){
 		"user-add":          userAdd,
 		"user-remove":       userRemove,
+		"user-list":         userList,
 		"authenticate":      authenticate,
 		"check-userdb":      checkUserDB,
 		"aliases-resolve":   aliasesResolve,
@@ -264,6 +269,49 @@ func userRemove() {
 	}
 
 	fmt.Println("Removed user")
+}
+
+// chasquid-util user-list <domain> [--receive_only] [--prefix=<prefix>]
+func userList() {
+	domain := args["$2"]
+	if domain == "" {
+		Fatalf("Domain missing, the syntax is 'user-list <domain>'")
+	}
+
+	path := userDBForDomain(domain)
+	// Like check-userdb, require the file to exist: userdb.Load does not treat
+	// a missing file as an error, but for listing we want to clearly tell apart
+	// "this domain has no userdb" from "the userdb is empty".
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		Fatalf("Error: file %q does not exist", path)
+	}
+
+	db, err := userdb.Load(path)
+	if err != nil {
+		Fatalf("Error loading database: %v", err)
+	}
+
+	prefix, hasPrefix := args["--prefix"]
+	_, onlyReceiveOnly := args["--receive_only"]
+
+	// db.Users() returns the names (local parts) sorted, so the output is
+	// deterministic regardless of on-disk ordering.
+	for _, user := range db.Users() {
+		if hasPrefix && !strings.HasPrefix(user, prefix) {
+			continue
+		}
+
+		receiveOnly := db.IsReceiveOnly(user)
+		if onlyReceiveOnly && !receiveOnly {
+			continue
+		}
+
+		if receiveOnly {
+			fmt.Printf("%s@%s (receive-only)\n", user, domain)
+		} else {
+			fmt.Printf("%s@%s\n", user, domain)
+		}
+	}
 }
 
 // chasquid-util aliases-resolve <address>
