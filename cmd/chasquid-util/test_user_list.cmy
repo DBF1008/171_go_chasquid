@@ -1,0 +1,141 @@
+# Tests for the user-list command.
+
+# Start with a clean slate.
+c = rm -rf .config/domains/domain/
+c wait 0
+
+# Listing a domain with no directory: file does not exist.
+c = ./chasquid-util -C=.config user-list domain
+c <~ Error: file .* does not exist
+c wait 1
+
+# Create an empty database by adding then removing a user.
+c = mkdir -p .config/domains/domain
+c wait 0
+
+# user-list on an empty DB: no users listed, just the summary.
+# The simplest way is to add a user and remove them, which creates the file.
+c = ./chasquid-util -C=.config user-add temp@domain --password=x
+c <- Added user
+c wait 0
+
+c = ./chasquid-util -C=.config user-remove temp@domain
+c <- Removed user
+c wait 0
+
+c = ./chasquid-util -C=.config user-list domain
+c <- ---
+c <- 0 users
+c wait 0
+
+# Add a mix of regular and receive-only users.
+c = ./chasquid-util -C=.config user-add alice@domain --password=p1
+c <- Added user
+c wait 0
+
+c = ./chasquid-util -C=.config user-add bob@domain --password=p2
+c <- Added user
+c wait 0
+
+c = ./chasquid-util -C=.config user-add charlie@domain --receive_only
+c <- Added user
+c wait 0
+
+c = ./chasquid-util -C=.config user-add dave@domain --receive_only
+c <- Added user
+c wait 0
+
+c = ./chasquid-util -C=.config user-add eve@domain --password=p3
+c <- Added user
+c wait 0
+
+# Full list (default sort by name).
+c = ./chasquid-util -C=.config user-list domain
+c <- alice
+c <- bob
+c <~ charlie\treceive-only
+c <~ dave\treceive-only
+c <- eve
+c <- ---
+c <- 5 users
+c wait 0
+
+# Filter by prefix.
+c = ./chasquid-util -C=.config user-list domain --prefix=d
+c <~ dave\treceive-only
+c <- ---
+c <- 1 users
+c wait 0
+
+# Filter by prefix with no matches.
+c = ./chasquid-util -C=.config user-list domain --prefix=z
+c <- ---
+c <- 0 users
+c wait 0
+
+# Filter by receive_only.
+c = ./chasquid-util -C=.config user-list domain --receive_only
+c <~ charlie\treceive-only
+c <~ dave\treceive-only
+c <- ---
+c <- 2 users
+c wait 0
+
+# Sort by receive-only: non-receive-only first, then receive-only.
+c = ./chasquid-util -C=.config user-list domain --sort=receive-only
+c <- alice
+c <- bob
+c <- eve
+c <~ charlie\treceive-only
+c <~ dave\treceive-only
+c <- ---
+c <- 5 users
+c wait 0
+
+# Combined filter: prefix + receive_only.
+c = ./chasquid-util -C=.config user-list domain --prefix=c --receive_only
+c <~ charlie\treceive-only
+c <- ---
+c <- 1 users
+c wait 0
+
+# Write-then-requery: add a new user, verify it appears immediately.
+c = ./chasquid-util -C=.config user-add frank@domain --password=p4
+c <- Added user
+c wait 0
+
+c = ./chasquid-util -C=.config user-list domain
+c <- alice
+c <- bob
+c <~ charlie\treceive-only
+c <~ dave\treceive-only
+c <- eve
+c <- frank
+c <- ---
+c <- 6 users
+c wait 0
+
+# Remove a user and verify it disappears.
+c = ./chasquid-util -C=.config user-remove bob@domain
+c <- Removed user
+c wait 0
+
+c = ./chasquid-util -C=.config user-list domain
+c <- alice
+c <~ charlie\treceive-only
+c <~ dave\treceive-only
+c <- eve
+c <- frank
+c <- ---
+c <- 5 users
+c wait 0
+
+# Missing domain argument.
+c = ./chasquid-util -C=.config user-list
+c <- Domain missing, use: chasquid-util user-list <domain>
+c wait 1
+
+# Invalid sort value.
+c = ./chasquid-util -C=.config user-list domain --sort=invalid
+c <~ Invalid --sort value
+c wait 1

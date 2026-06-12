@@ -34,6 +34,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"sync"
 
 	"golang.org/x/crypto/scrypt"
@@ -212,6 +213,35 @@ func (db *DB) Len() int {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	return len(db.db.Users)
+}
+
+// UserEntry represents a single user in the database, with metadata about
+// their account type.
+type UserEntry struct {
+	Name       string
+	ReceiveOnly bool
+}
+
+// Users returns a sorted list of all users in the database.
+// The list is sorted alphabetically by username.
+func (db *DB) Users() []UserEntry {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	entries := make([]UserEntry, 0, len(db.db.Users))
+	for name, passwd := range db.db.Users {
+		_, receiveOnly := passwd.Scheme.(*Password_Denied)
+		entries = append(entries, UserEntry{
+			Name:        name,
+			ReceiveOnly: receiveOnly,
+		})
+	}
+
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].Name < entries[j].Name
+	})
+
+	return entries
 }
 
 ///////////////////////////////////////////////////////////

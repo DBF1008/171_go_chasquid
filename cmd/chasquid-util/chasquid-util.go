@@ -30,6 +30,8 @@ Usage:
     Add a user to the userdb.
   chasquid-util [options] user-remove <user@domain>
     Remove a user from the userdb.
+  chasquid-util [options] user-list <domain> [--prefix=<prefix>] [--receive_only] [--sort=name|receive-only]
+    List users in the userdb for the given domain.
   chasquid-util [options] authenticate <user@domain> [--password=<password>]
     Authenticate a user.
   chasquid-util [options] check-userdb <domain>
@@ -88,6 +90,7 @@ func main() {
 	commands := map[string]func(){
 		"user-add":          userAdd,
 		"user-remove":       userRemove,
+		"user-list":         userList,
 		"authenticate":      authenticate,
 		"check-userdb":      checkUserDB,
 		"aliases-resolve":   aliasesResolve,
@@ -264,6 +267,67 @@ func userRemove() {
 	}
 
 	fmt.Println("Removed user")
+}
+
+// chasquid-util user-list <domain> [--prefix=<prefix>] [--receive_only] [--sort=name|receive-only]
+func userList() {
+	domain := args["$2"]
+	if domain == "" {
+		Fatalf("Domain missing, use: chasquid-util user-list <domain>")
+	}
+
+	path := userDBForDomain(domain)
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		Fatalf("Error: file %q does not exist", path)
+	}
+
+	db, err := userdb.Load(path)
+	if err != nil {
+		Fatalf("Error loading database: %v", err)
+	}
+
+	prefix, _ := args["--prefix"]
+	_, recvOnlyFilter := args["--receive_only"]
+	sortBy, _ := args["--sort"]
+	if sortBy == "" {
+		sortBy = "name"
+	}
+	if sortBy != "name" && sortBy != "receive-only" {
+		Fatalf("Invalid --sort value %q, must be 'name' or 'receive-only'", sortBy)
+	}
+
+	users := db.Users()
+
+	// Apply filters.
+	filtered := make([]userdb.UserEntry, 0)
+	for _, u := range users {
+		if prefix != "" && !strings.HasPrefix(u.Name, prefix) {
+			continue
+		}
+		if recvOnlyFilter && !u.ReceiveOnly {
+			continue
+		}
+		filtered = append(filtered, u)
+	}
+
+	// Apply sorting (base sort by name is already done by Users()).
+	if sortBy == "receive-only" {
+		sort.SliceStable(filtered, func(i, j int) bool {
+			if filtered[i].ReceiveOnly != filtered[j].ReceiveOnly {
+				return !filtered[i].ReceiveOnly
+			}
+			return filtered[i].Name < filtered[j].Name
+		})
+	}
+
+	for _, u := range filtered {
+		if u.ReceiveOnly {
+			fmt.Printf("%s\treceive-only\n", u.Name)
+		} else {
+			fmt.Printf("%s\n", u.Name)
+		}
+	}
+	fmt.Printf("---\n%d users\n", len(filtered))
 }
 
 // chasquid-util aliases-resolve <address>

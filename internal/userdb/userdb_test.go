@@ -363,3 +363,59 @@ func TestExists(t *testing.T) {
 		t.Errorf("known (denied) user does not exist")
 	}
 }
+
+func TestUsers(t *testing.T) {
+	fname := mustCreateDB(t, "")
+	defer removeIfSuccessful(t, fname)
+	db := mustLoad(t, fname)
+
+	// Empty database.
+	users := db.Users()
+	if len(users) != 0 {
+		t.Errorf("empty db: expected 0 users, got %d", len(users))
+	}
+
+	// Add a mix of regular and receive-only users.
+	if err := db.AddUser("charlie", "pass"); err != nil {
+		t.Fatalf("AddUser(charlie): %v", err)
+	}
+	if err := db.AddDeniedUser("alice"); err != nil {
+		t.Fatalf("AddDeniedUser(alice): %v", err)
+	}
+	if err := db.AddUser("bob", "pass"); err != nil {
+		t.Fatalf("AddUser(bob): %v", err)
+	}
+	if err := db.AddDeniedUser("dave"); err != nil {
+		t.Fatalf("AddDeniedUser(dave): %v", err)
+	}
+
+	users = db.Users()
+	if len(users) != 4 {
+		t.Fatalf("expected 4 users, got %d", len(users))
+	}
+
+	// Users() returns them sorted alphabetically.
+	expected := []UserEntry{
+		{"alice", true},
+		{"bob", false},
+		{"charlie", false},
+		{"dave", true},
+	}
+	for i, exp := range expected {
+		if users[i] != exp {
+			t.Errorf("users[%d] = %+v, want %+v", i, users[i], exp)
+		}
+	}
+
+	// After removing a user, Users() reflects the change.
+	db.RemoveUser("bob")
+	users = db.Users()
+	if len(users) != 3 {
+		t.Fatalf("after remove: expected 3 users, got %d", len(users))
+	}
+	for _, u := range users {
+		if u.Name == "bob" {
+			t.Error("removed user bob still present in Users()")
+		}
+	}
+}
