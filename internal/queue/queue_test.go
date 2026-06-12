@@ -3,6 +3,7 @@ package queue
 import (
 	"bytes"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -337,5 +338,282 @@ func mkR(a string, t Recipient_Type, s Recipient_Status, m, o string) *Recipient
 		Status:             s,
 		LastFailureMessage: m,
 		OriginalAddress:    o,
+	}
+}
+
+func TestViewEmpty(t *testing.T) {
+	dir := testlib.MustTempDir(t)
+	defer testlib.RemoveIfOk(t, dir)
+	q, _ := New(dir, set.NewString("loco"),
+		aliases.NewResolver(allUsersExist),
+		testlib.DumbCourier, testlib.DumbCourier)
+
+	view := q.View("")
+	if view.Length != 0 || len(view.Items) != 0 {
+		t.Errorf("empty queue: expected no items, got length=%d items=%v",
+			view.Length, view.Items)
+	}
+	if !view.OldestCreatedAt.IsZero() {
+		t.Errorf("empty queue: expected zero oldest time, got %v",
+			view.OldestCreatedAt)
+	}
+	if view.PendingRcpts != 0 || view.SentRcpts != 0 || view.FailedRcpts != 0 {
+		t.Errorf("empty queue: expected zero counts, got p=%d s=%d f=%d",
+			view.PendingRcpts, view.SentRcpts, view.FailedRcpts)
+	}
+	// The maps must be non-nil and empty so automation can rely on them.
+	if view.FailureReasons == nil || len(view.FailureReasons) != 0 {
+		t.Errorf("empty queue: expected empty FailureReasons, got %v",
+			view.FailureReasons)
+	}
+	if view.ItemsByDomain == nil || len(view.ItemsByDomain) != 0 {
+		t.Errorf("empty queue: expected empty ItemsByDomain, got %v",
+			view.ItemsByDomain)
+	}
+}
+
+// fillQueueForView force-inserts a few backlogged items, in a non-chronological
+// order, to exercise the structured view's aggregation, sorting and filtering.
+func fillQueueForView(q *Queue, now time.Time) {
+	add := func(id string, age time.Duration, rcpts ...*Recipient) {
+		q.q[id] = &Item{
+			Message: Message{
+				ID:   id,
+				From: "sender@loco",
+				To:   []string{rcpts[0].OriginalAddress},
+				Rcpt: rcpts,
+				Data: []byte("data"),
+			},
+			CreatedAt: now.Add(-age),
+		}
+	}
+
+	add("item-c", 1*time.Hour,
+		mkR("a@example.com", Recipient_EMAIL, Recipient_PENDING,
+			"deferred: timeout", "a@example.com"))
+	add("item-a", 3*time.Hour,
+		mkR("b@example.com", Recipient_EMAIL, Recipient_FAILED,
+			"550 no such user", "b@example.com"),
+		mkR("c@other.net", Recipient_EMAIL, Recipient_PENDING,
+			"deferred: timeout", "c@other.net"))
+	add("item-b", 2*time.Hour,
+		mkR("d@other.net", Recipient_EMAIL, Recipient_SENT,
+			"", "d@other.net"))
+}
+
+func TestViewBacklog(t *testing.T) {
+	dir := testlib.MustTempDir(t)
+	defer testlib.RemoveIfOk(t, dir)
+	q, _ := New(dir, set.NewString("loco"),
+		aliases.NewResolver(allUsersExist),
+		testlib.DumbCourier, testlib.DumbCourier)
+
+	now := time.Now()
+	fillQueueForView(q, now)
+
+	view := q.View("")
+
+	if view.Length != 3 {
+		t.Errorf("expected 3 items, got %d", view.Length)
+	}
+
+	// Sorting: oldest first => item-a (3h), item-b (2h), item-c (1h).
+	var gotOrder []string
+	for _, it := range view.Items {
+		gotOrder = append(gotOrder, it.ID)
+	}
+	if want := []string{"item-a", "item-b", "item-c"}; !reflect.DeepEqual(gotOrder, want) {
+		t.Errorf("wrong item order: got %v, want %v", gotOrder, want)
+	}
+
+	// Oldest reported time is item-a's creation time.
+	if !view.OldestCreatedAt.Equal(now.Add(-3 * time.Hour)) {
+		t.Errorf("wrong oldest time: got %v, want %v",
+			view.OldestCreatedAt, now.Add(-3*time.Hour))
+	}
+
+	// Recipient status counts: pending 2 (a, c), failed 1 (b), sent 1 (d).
+	if view.PendingRcpts != 2 || view.FailedRcpts != 1 || view.SentRcpts != 1 {
+		t.Errorf("wrong status counts: pending=%d failed=%d sent=%d",
+			view.PendingRcpts, view.FailedRcpts, view.SentRcpts)
+	}
+
+	// Failure reasons aggregated across recipients.
+	if n := view.FailureReasons["deferred: timeout"]; n != 2 {
+		t.Errorf("expected 2 'deferred: timeout', got %d", n)
+	}
+	if n := view.FailureReasons["550 no such user"]; n != 1 {
+		t.Errorf("expected 1 '550 no such user', got %d", n)
+	}
+	if _, ok := view.FailureReasons[""]; ok {
+		t.Error("empty failure message should not be counted")
+	}
+
+	// Items by domain: example.com -> 2 (item-c, item-a),
+	// other.net -> 2 (item-a, item-b).
+	if view.ItemsByDomain["example.com"] != 2 {
+		t.Errorf("expected 2 items for example.com, got %d",
+			view.ItemsByDomain["example.com"])
+	}
+	if view.ItemsByDomain["other.net"] != 2 {
+		t.Errorf("expected 2 items for other.net, got %d",
+			view.ItemsByDomain["other.net"])
+	}
+
+	// The recipient details are carried through, with enums as readable strings.
+	itemA := view.Items[0]
+	if len(itemA.Rcpt) != 2 {
+		t.Fatalf("item-a: expected 2 recipients, got %d", len(itemA.Rcpt))
+	}
+	r0 := itemA.Rcpt[0]
+	if r0.Address != "b@example.com" || r0.Status != "FAILED" ||
+		r0.Type != "EMAIL" || r0.LastFailureMessage != "550 no such user" {
+		t.Errorf("item-a recipient 0 wrong: %+v", r0)
+	}
+}
+
+func TestViewDomainFilter(t *testing.T) {
+	dir := testlib.MustTempDir(t)
+	defer testlib.RemoveIfOk(t, dir)
+	q, _ := New(dir, set.NewString("loco"),
+		aliases.NewResolver(allUsersExist),
+		testlib.DumbCourier, testlib.DumbCourier)
+
+	fillQueueForView(q, time.Now())
+
+	// Filter to example.com: only item-a and item-c have a recipient there.
+	view := q.View("example.com")
+	if view.Length != 2 {
+		t.Errorf("filtered: expected 2 items, got %d", view.Length)
+	}
+	var got []string
+	for _, it := range view.Items {
+		got = append(got, it.ID)
+	}
+	if want := []string{"item-a", "item-c"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("filtered order: got %v, want %v", got, want)
+	}
+
+	// Aggregates are computed over the filtered subset. item-a contributes
+	// b@example.com (FAILED) and c@other.net (PENDING); item-c contributes
+	// a@example.com (PENDING). So pending=2, failed=1, sent=0.
+	if view.PendingRcpts != 2 || view.FailedRcpts != 1 || view.SentRcpts != 0 {
+		t.Errorf("filtered status counts: pending=%d failed=%d sent=%d",
+			view.PendingRcpts, view.FailedRcpts, view.SentRcpts)
+	}
+
+	// Filtering by a domain not present yields an empty (but well-formed) view.
+	empty := q.View("nope.invalid")
+	if empty.Length != 0 || len(empty.Items) != 0 {
+		t.Errorf("filter by unknown domain: expected empty, got %+v", empty)
+	}
+	if !empty.OldestCreatedAt.IsZero() {
+		t.Errorf("filter by unknown domain: expected zero oldest, got %v",
+			empty.OldestCreatedAt)
+	}
+}
+
+func TestViewConsistentWithDumpString(t *testing.T) {
+	dir := testlib.MustTempDir(t)
+	defer testlib.RemoveIfOk(t, dir)
+	q, _ := New(dir, set.NewString("loco"),
+		aliases.NewResolver(allUsersExist),
+		testlib.DumbCourier, testlib.DumbCourier)
+
+	fillQueueForView(q, time.Now())
+
+	dump := q.DumpString()
+	view := q.View("")
+
+	// The text dump reports the same length as the structured view.
+	if !strings.Contains(dump, fmt.Sprintf("length: %d", view.Length)) {
+		t.Errorf("DumpString length does not match view length %d:\n%s",
+			view.Length, dump)
+	}
+
+	// Every item ID, recipient address and failure message present in the
+	// structured view also appears in the text dump (same underlying state).
+	for _, it := range view.Items {
+		if !strings.Contains(dump, it.ID) {
+			t.Errorf("item %q missing from DumpString:\n%s", it.ID, dump)
+		}
+		for _, r := range it.Rcpt {
+			if !strings.Contains(dump, r.Address) {
+				t.Errorf("recipient %q missing from DumpString:\n%s",
+					r.Address, dump)
+			}
+			if r.LastFailureMessage != "" &&
+				!strings.Contains(dump, r.LastFailureMessage) {
+				t.Errorf("failure %q missing from DumpString:\n%s",
+					r.LastFailureMessage, dump)
+			}
+		}
+	}
+}
+
+func TestViewAfterReload(t *testing.T) {
+	dir := testlib.MustTempDir(t)
+	defer testlib.RemoveIfOk(t, dir)
+
+	// Write an item to disk, as if it had been queued before a restart.
+	orig := &Item{
+		Message: Message{
+			ID:   <-newID,
+			From: "from@loco",
+			To:   []string{"to@remote"},
+			Rcpt: []*Recipient{
+				mkR("to@remote", Recipient_EMAIL, Recipient_PENDING,
+					"deferred: connection refused", "to@remote"),
+			},
+			Data: []byte("data"),
+		},
+		CreatedAt: time.Now().Add(-2 * time.Hour),
+	}
+	if err := orig.WriteTo(dir); err != nil {
+		t.Fatalf("failed to write item: %v", err)
+	}
+
+	// Reload it from disk (simulating a restart) and place it in a fresh queue
+	// without launching the send loops, so the state stays stable while we
+	// inspect it.
+	reloaded, err := ItemFromFile(
+		fmt.Sprintf("%s/%s%s", dir, itemFilePrefix, orig.ID))
+	if err != nil {
+		t.Fatalf("failed to reload item: %v", err)
+	}
+	q, _ := New(dir, set.NewString("loco"),
+		aliases.NewResolver(allUsersExist),
+		testlib.DumbCourier, testlib.DumbCourier)
+	q.q[reloaded.ID] = reloaded
+
+	view := q.View("")
+	if view.Length != 1 {
+		t.Fatalf("expected 1 item after reload, got %d", view.Length)
+	}
+
+	got := view.Items[0]
+	if got.ID != reloaded.ID || got.From != "from@loco" {
+		t.Errorf("unexpected reloaded item: %+v", got)
+	}
+	if !reflect.DeepEqual(got.To, []string{"to@remote"}) {
+		t.Errorf("reloaded To wrong: %v", got.To)
+	}
+	// The persisted timestamp survives the round-trip.
+	if !got.CreatedAt.Equal(reloaded.CreatedAt) {
+		t.Errorf("CreatedAt mismatch: got %v, want %v",
+			got.CreatedAt, reloaded.CreatedAt)
+	}
+	if !view.OldestCreatedAt.Equal(reloaded.CreatedAt) {
+		t.Errorf("OldestCreatedAt mismatch: got %v, want %v",
+			view.OldestCreatedAt, reloaded.CreatedAt)
+	}
+	if view.PendingRcpts != 1 {
+		t.Errorf("expected 1 pending rcpt, got %d", view.PendingRcpts)
+	}
+	if n := view.FailureReasons["deferred: connection refused"]; n != 1 {
+		t.Errorf("expected failure reason count 1, got %d", n)
+	}
+	if n := view.ItemsByDomain["remote"]; n != 1 {
+		t.Errorf("expected 1 item for domain remote, got %d", n)
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"flag"
 	"fmt"
@@ -239,6 +240,20 @@ func (s *Server) InitQueue(path string, localC, remoteC courier.Courier) {
 
 	http.HandleFunc("/debug/queue",
 		func(w http.ResponseWriter, r *http.Request) {
+			// Default to the human-readable text dump. With ?format=json,
+			// return a structured snapshot for monitoring and automation; the
+			// optional ?domain= restricts it to a single recipient domain.
+			if r.URL.Query().Get("format") == "json" {
+				view := q.View(r.URL.Query().Get("domain"))
+				w.Header().Set("Content-Type", "application/json")
+				enc := json.NewEncoder(w)
+				enc.SetIndent("", "  ")
+				if err := enc.Encode(view); err != nil {
+					http.Error(w, err.Error(),
+						http.StatusInternalServerError)
+				}
+				return
+			}
 			_, _ = w.Write([]byte(q.DumpString()))
 		})
 }

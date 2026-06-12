@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -269,6 +270,148 @@ func (q *Queue) DumpString() string {
 	}
 
 	return s
+}
+
+// QueueView is a structured, point-in-time snapshot of the queue.
+//
+// It is meant for monitoring dashboards and automation, and is built from the
+// same in-memory queue state as DumpString, so the two are consistent with each
+// other (and, after a restart, with the queue reloaded from disk by Load).
+type QueueView struct {
+	// Date is when this view was generated.
+	Date time.Time `json:"date"`
+
+	// Length is the number of items (messages) included in this view. When a
+	// domain filter is applied, it only counts the matching items.
+	Length int `json:"length"`
+
+	// OldestCreatedAt is the creation time of the oldest item in the view. It is
+	// the zero time if the view is empty.
+	OldestCreatedAt time.Time `json:"oldest_created_at"`
+
+	// Recipient counts across all items in the view, broken down by status.
+	PendingRcpts int `json:"pending_rcpts"`
+	SentRcpts    int `json:"sent_rcpts"`
+	FailedRcpts  int `json:"failed_rcpts"`
+
+	// FailureReasons maps a recipient's last failure message to the number of
+	// recipients that have it. Recipients without a failure message are not
+	// counted.
+	FailureReasons map[string]int `json:"failure_reasons"`
+
+	// ItemsByDomain maps a recipient domain to the number of items in the view
+	// that have at least one recipient in that domain.
+	ItemsByDomain map[string]int `json:"items_by_domain"`
+
+	// Items are the queue entries in the view, sorted by creation time (oldest
+	// first), with the item ID as a tie-breaker for stable ordering.
+	Items []*ItemView `json:"items"`
+}
+
+// ItemView is the structured view of a single queue item.
+type ItemView struct {
+	ID        string          `json:"id"`
+	From      string          `json:"from"`
+	To        []string        `json:"to"`
+	CreatedAt time.Time       `json:"created_at"`
+	Rcpt      []RecipientView `json:"rcpt"`
+}
+
+// RecipientView is the structured view of a single recipient of a queue item.
+type RecipientView struct {
+	Address            string `json:"address"`
+	OriginalAddress    string `json:"original_address"`
+	Type               string `json:"type"`
+	Status             string `json:"status"`
+	LastFailureMessage string `json:"last_failure_message"`
+}
+
+// View returns a structured snapshot of the queue.
+//
+// If domain is non-empty, only items that have at least one recipient in that
+// domain are included, and all the aggregate statistics are computed over that
+// filtered subset. If domain is empty, the whole queue is included.
+func (q *Queue) View(domain string) *QueueView {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+
+	view := &QueueView{
+		Date:           time.Now(),
+		FailureReasons: map[string]int{},
+		ItemsByDomain:  map[string]int{},
+	}
+
+	for _, item := range q.q {
+		item.Lock()
+		iv, domains := itemToView(item)
+		item.Unlock()
+
+		if domain != "" && !domains[domain] {
+			continue
+		}
+
+		view.Items = append(view.Items, iv)
+		for d := range domains {
+			view.ItemsByDomain[d]++
+		}
+		for _, rcpt := range iv.Rcpt {
+			switch rcpt.Status {
+			case Recipient_PENDING.String():
+				view.PendingRcpts++
+			case Recipient_SENT.String():
+				view.SentRcpts++
+			case Recipient_FAILED.String():
+				view.FailedRcpts++
+			}
+			if rcpt.LastFailureMessage != "" {
+				view.FailureReasons[rcpt.LastFailureMessage]++
+			}
+		}
+	}
+
+	view.Length = len(view.Items)
+
+	// Sort oldest first, with the ID as a stable tie-breaker. This gives
+	// automation a deterministic order regardless of map iteration, and puts
+	// the most-stuck item at the head for backlog triage.
+	sort.Slice(view.Items, func(i, j int) bool {
+		a, b := view.Items[i], view.Items[j]
+		if !a.CreatedAt.Equal(b.CreatedAt) {
+			return a.CreatedAt.Before(b.CreatedAt)
+		}
+		return a.ID < b.ID
+	})
+
+	if len(view.Items) > 0 {
+		view.OldestCreatedAt = view.Items[0].CreatedAt
+	}
+
+	return view
+}
+
+// itemToView converts a queue item to its structured view, and returns the set
+// of recipient domains it touches. The caller must hold item's lock.
+func itemToView(item *Item) (*ItemView, map[string]bool) {
+	iv := &ItemView{
+		ID:        item.ID,
+		From:      item.From,
+		To:        append([]string(nil), item.To...),
+		CreatedAt: item.CreatedAt,
+	}
+	domains := map[string]bool{}
+	for _, rcpt := range item.Rcpt {
+		iv.Rcpt = append(iv.Rcpt, RecipientView{
+			Address:            rcpt.Address,
+			OriginalAddress:    rcpt.OriginalAddress,
+			Type:               rcpt.Type.String(),
+			Status:             rcpt.Status.String(),
+			LastFailureMessage: rcpt.LastFailureMessage,
+		})
+		if d := envelope.DomainOf(rcpt.Address); d != "" {
+			domains[d] = true
+		}
+	}
+	return iv, domains
 }
 
 // An Item in the queue.
