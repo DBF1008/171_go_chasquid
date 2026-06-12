@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -275,6 +276,42 @@ func (s *Server) dinfoClearRPC(tr *trace.Trace, req url.Values) (url.Values, err
 	return nil, nil
 }
 
+// encodeDomainStates serializes domain states into a columnar url.Values: one
+// element per domain (in the given order) spread across parallel arrays. This
+// keeps the wire format simple and deterministic for the chasquid-util client.
+func encodeDomainStates(states []domaininfo.DomainState) url.Values {
+	v := url.Values{}
+	for _, st := range states {
+		d := st.Effective()
+		v.Add("name", st.Name)
+		v.Add("incoming", d.IncomingSecLevel.String())
+		v.Add("outgoing", d.OutgoingSecLevel.String())
+		v.Add("cached", strconv.FormatBool(st.InCache()))
+		v.Add("persisted", strconv.FormatBool(st.Persisted()))
+		v.Add("consistent", strconv.FormatBool(st.Consistent()))
+	}
+	return v
+}
+
+func (s *Server) dinfoListRPC(tr *trace.Trace, req url.Values) (url.Values, error) {
+	states, err := s.dinfo.Dump()
+	if err != nil {
+		return nil, err
+	}
+	return encodeDomainStates(states), nil
+}
+
+func (s *Server) dinfoGetRPC(tr *trace.Trace, req url.Values) (url.Values, error) {
+	st, ok, err := s.dinfo.Info(req.Get("Domain"))
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, fmt.Errorf("domain not found")
+	}
+	return encodeDomainStates([]domaininfo.DomainState{st}), nil
+}
+
 // periodicallyReload some of the server's information that can be changed
 // without the server knowing, such as aliases and the user databases.
 func (s *Server) periodicallyReload() {
@@ -314,6 +351,8 @@ func (s *Server) ListenAndServe() {
 
 	localrpc.DefaultServer.Register("AliasResolve", s.aliasResolveRPC)
 	localrpc.DefaultServer.Register("DomaininfoClear", s.dinfoClearRPC)
+	localrpc.DefaultServer.Register("DomaininfoList", s.dinfoListRPC)
+	localrpc.DefaultServer.Register("DomaininfoGet", s.dinfoGetRPC)
 
 	go s.periodicallyReload()
 

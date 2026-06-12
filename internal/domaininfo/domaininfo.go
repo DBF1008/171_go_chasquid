@@ -4,10 +4,13 @@ package domaininfo
 
 import (
 	"fmt"
+	"sort"
 	"sync"
 
 	"blitiri.com.ar/go/chasquid/internal/protoio"
 	"blitiri.com.ar/go/chasquid/internal/trace"
+
+	"google.golang.org/protobuf/proto"
 )
 
 // Command to generate domaininfo.pb.go.
@@ -181,4 +184,119 @@ func (db *DB) Clear(tr *trace.Trace, domain string) bool {
 	db.write(tr, d)
 	tr.Printf("set to plain")
 	return true
+}
+
+// DomainState is a point-in-time snapshot of a domain's information. It
+// combines the in-memory cache with what is persisted on disk, so callers can
+// detect divergence between the two (e.g. an entry that is cached but not yet
+// persisted, or persisted with a different value).
+type DomainState struct {
+	Name string
+
+	// Cached is the domain as held in the in-memory cache, or nil if the
+	// domain is not in the cache.
+	Cached *Domain
+
+	// Stored is the domain as persisted on disk, or nil if the domain is not
+	// on disk.
+	Stored *Domain
+}
+
+// Effective returns the domain record that is in effect: the cached one if
+// present, otherwise the stored one. It is never nil for a DomainState
+// returned by Dump or Info.
+func (s DomainState) Effective() *Domain {
+	if s.Cached != nil {
+		return s.Cached
+	}
+	return s.Stored
+}
+
+// InCache returns whether the domain is present in the in-memory cache.
+func (s DomainState) InCache() bool { return s.Cached != nil }
+
+// Persisted returns whether the domain is persisted on disk.
+func (s DomainState) Persisted() bool { return s.Stored != nil }
+
+// Consistent returns whether the cached and stored records both exist and
+// hold the same values.
+func (s DomainState) Consistent() bool {
+	return s.Cached != nil && s.Stored != nil && proto.Equal(s.Cached, s.Stored)
+}
+
+// Dump returns a snapshot of all known domains, sorted by name. The result is
+// the union of the in-memory cache and the on-disk store, so divergence
+// between them is visible to the caller. The returned records are copies; the
+// caller may modify them freely.
+func (db *DB) Dump() ([]DomainState, error) {
+	db.Lock()
+	defer db.Unlock()
+
+	states := map[string]*DomainState{}
+	for name, d := range db.info {
+		states[name] = &DomainState{
+			Name:   name,
+			Cached: proto.Clone(d).(*Domain),
+		}
+	}
+
+	ids, err := db.store.ListIDs()
+	if err != nil {
+		return nil, err
+	}
+	for _, id := range ids {
+		d := &Domain{}
+		ok, err := db.store.Get(id, d)
+		if err != nil {
+			return nil, fmt.Errorf("error loading %q: %v", id, err)
+		}
+		if !ok {
+			continue
+		}
+		st, exists := states[d.Name]
+		if !exists {
+			st = &DomainState{Name: d.Name}
+			states[d.Name] = st
+		}
+		st.Stored = d
+	}
+
+	names := make([]string, 0, len(states))
+	for name := range states {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	out := make([]DomainState, 0, len(names))
+	for _, name := range names {
+		out = append(out, *states[name])
+	}
+	return out, nil
+}
+
+// Info returns the snapshot for a single domain. ok is false if the domain is
+// neither cached nor persisted on disk. The returned records are copies.
+func (db *DB) Info(domain string) (state DomainState, ok bool, err error) {
+	db.Lock()
+	defer db.Unlock()
+
+	st := DomainState{Name: domain}
+	found := false
+
+	if d, exists := db.info[domain]; exists {
+		st.Cached = proto.Clone(d).(*Domain)
+		found = true
+	}
+
+	d := &Domain{}
+	onDisk, err := db.store.Get(domain, d)
+	if err != nil {
+		return DomainState{}, false, err
+	}
+	if onDisk {
+		st.Stored = d
+		found = true
+	}
+
+	return st, found, nil
 }

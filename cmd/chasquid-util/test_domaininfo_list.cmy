@@ -1,0 +1,33 @@
+# Test success: two domains, one of which is in the cache but not on disk.
+server unix_listen .data/localrpc-v1
+c = ./chasquid-util -C=.config domaininfo-list
+
+# The request carries no parameters, so match it loosely (it has a trailing
+# space on the wire that is awkward to match exactly).
+server <~ DomaininfoList
+server -> 200 name=a.example&name=b.example&incoming=TLS_SECURE&incoming=PLAIN&outgoing=TLS_CLIENT&outgoing=PLAIN&cached=true&cached=true&persisted=true&persisted=false&consistent=true&consistent=false
+
+c <- a.example incoming=TLS_SECURE outgoing=TLS_CLIENT persisted=true
+c <- b.example incoming=PLAIN outgoing=PLAIN persisted=false  (NOT ON DISK)
+c wait 0
+
+
+# Test empty: no entries means no output.
+server unix_listen .data/localrpc-v1
+c = ./chasquid-util -C=.config domaininfo-list
+
+server <~ DomaininfoList
+server -> 200
+
+c wait 0
+
+
+# Test error.
+server unix_listen .data/localrpc-v1
+c = ./chasquid-util -C=.config domaininfo-list
+
+server <~ DomaininfoList
+server -> 500 This is a test error
+
+c <- Error listing domaininfo: This is a test error
+c wait 1

@@ -204,3 +204,222 @@ func TestDirectoryErrors(t *testing.T) {
 		t.Errorf("got %v, expected %v", err, os.ErrNotExist)
 	}
 }
+
+func findState(states []DomainState, name string) (DomainState, bool) {
+	for _, s := range states {
+		if s.Name == name {
+			return s, true
+		}
+	}
+	return DomainState{}, false
+}
+
+func TestDump(t *testing.T) {
+	dir := testlib.MustTempDir(t)
+	defer testlib.RemoveIfOk(t, dir)
+	db, err := New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := trace.New("test", "dump")
+	defer tr.Finish()
+
+	// Empty database: the dump has no entries.
+	states, err := db.Dump()
+	if err != nil {
+		t.Fatalf("Dump on empty db: %v", err)
+	}
+	if len(states) != 0 {
+		t.Errorf("Dump on empty db: got %d entries, want 0: %v", len(states), states)
+	}
+
+	// Record a couple of domains at non-default levels.
+	db.IncomingSecLevel(tr, "a-example", SecLevel_TLS_SECURE)
+	db.OutgoingSecLevel(tr, "a-example", SecLevel_TLS_CLIENT)
+	db.IncomingSecLevel(tr, "b-example", SecLevel_TLS_INSECURE)
+
+	// After the update, re-querying reflects the new levels. Entries are
+	// sorted by name, present in both the cache and on disk, and consistent.
+	states, err = db.Dump()
+	if err != nil {
+		t.Fatalf("Dump after update: %v", err)
+	}
+	if len(states) != 2 {
+		t.Fatalf("Dump after update: got %d entries, want 2: %v", len(states), states)
+	}
+	if states[0].Name != "a-example" || states[1].Name != "b-example" {
+		t.Errorf("Dump not sorted by name: %v", states)
+	}
+
+	a, ok := findState(states, "a-example")
+	if !ok {
+		t.Fatalf("a-example missing from dump: %v", states)
+	}
+	if got := a.Effective().IncomingSecLevel; got != SecLevel_TLS_SECURE {
+		t.Errorf("a-example incoming: got %s, want TLS_SECURE", got)
+	}
+	if got := a.Effective().OutgoingSecLevel; got != SecLevel_TLS_CLIENT {
+		t.Errorf("a-example outgoing: got %s, want TLS_CLIENT", got)
+	}
+	if !a.InCache() || !a.Persisted() || !a.Consistent() {
+		t.Errorf("a-example: cache=%v persisted=%v consistent=%v, want all true",
+			a.InCache(), a.Persisted(), a.Consistent())
+	}
+
+	// Consistency with disk: a fresh DB loads purely from disk, so its dump
+	// must match the running one.
+	db2, err := New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	states2, err := db2.Dump()
+	if err != nil {
+		t.Fatalf("Dump from reloaded db: %v", err)
+	}
+	if len(states2) != len(states) {
+		t.Fatalf("reloaded dump has %d entries, want %d", len(states2), len(states))
+	}
+	for i := range states {
+		got, want := states2[i], states[i]
+		if got.Name != want.Name ||
+			got.Effective().IncomingSecLevel != want.Effective().IncomingSecLevel ||
+			got.Effective().OutgoingSecLevel != want.Effective().OutgoingSecLevel {
+			t.Errorf("reloaded dump[%d] = %v, want %v", i, got, want)
+		}
+		if !got.Consistent() {
+			t.Errorf("reloaded dump[%d] (%s) not consistent with disk", i, got.Name)
+		}
+	}
+
+	// After cleanup (Clear), the entry remains but is reset to plain, and the
+	// change is reflected on disk too.
+	if !db.Clear(tr, "a-example") {
+		t.Fatal("Clear(a-example) returned false")
+	}
+	states, err = db.Dump()
+	if err != nil {
+		t.Fatalf("Dump after clear: %v", err)
+	}
+	a, ok = findState(states, "a-example")
+	if !ok {
+		t.Fatalf("a-example disappeared after clear: %v", states)
+	}
+	if a.Effective().IncomingSecLevel != SecLevel_PLAIN ||
+		a.Effective().OutgoingSecLevel != SecLevel_PLAIN {
+		t.Errorf("a-example not reset to plain after clear: %v", a.Effective())
+	}
+	if !a.InCache() || !a.Persisted() || !a.Consistent() {
+		t.Errorf("a-example after clear: cache=%v persisted=%v consistent=%v, want all true",
+			a.InCache(), a.Persisted(), a.Consistent())
+	}
+}
+
+func TestDumpDivergence(t *testing.T) {
+	dir := testlib.MustTempDir(t)
+	defer testlib.RemoveIfOk(t, dir)
+	db, err := New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := trace.New("test", "divergence")
+	defer tr.Finish()
+
+	// "cached": recorded normally, so it is in both the cache and on disk.
+	db.IncomingSecLevel(tr, "cached", SecLevel_TLS_SECURE)
+
+	// "diskonly": written straight to the store, bypassing the cache, to
+	// simulate an on-disk entry the running server has not loaded.
+	err = db.store.Put("diskonly", &Domain{
+		Name:             "diskonly",
+		IncomingSecLevel: SecLevel_TLS_SECURE,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// "cacheonly": remove the on-disk file of a cached entry, to simulate a
+	// cached entry that is not persisted.
+	if err := os.Remove(dir + "/s:cached"); err != nil {
+		t.Fatal(err)
+	}
+
+	states, err := db.Dump()
+	if err != nil {
+		t.Fatalf("Dump: %v", err)
+	}
+
+	cacheonly, ok := findState(states, "cached")
+	if !ok {
+		t.Fatalf("cached entry missing: %v", states)
+	}
+	if !cacheonly.InCache() || cacheonly.Persisted() || cacheonly.Consistent() {
+		t.Errorf("cache-only entry: cache=%v persisted=%v consistent=%v, want true/false/false",
+			cacheonly.InCache(), cacheonly.Persisted(), cacheonly.Consistent())
+	}
+
+	diskonly, ok := findState(states, "diskonly")
+	if !ok {
+		t.Fatalf("diskonly entry missing: %v", states)
+	}
+	if diskonly.InCache() || !diskonly.Persisted() || diskonly.Consistent() {
+		t.Errorf("disk-only entry: cache=%v persisted=%v consistent=%v, want false/true/false",
+			diskonly.InCache(), diskonly.Persisted(), diskonly.Consistent())
+	}
+	if got := diskonly.Effective().IncomingSecLevel; got != SecLevel_TLS_SECURE {
+		t.Errorf("disk-only effective incoming: got %s, want TLS_SECURE", got)
+	}
+}
+
+func TestInfo(t *testing.T) {
+	dir := testlib.MustTempDir(t)
+	defer testlib.RemoveIfOk(t, dir)
+	db, err := New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := trace.New("test", "info")
+	defer tr.Finish()
+
+	// Unknown domain.
+	if _, ok, err := db.Info("nope"); err != nil {
+		t.Fatalf("Info(nope): %v", err)
+	} else if ok {
+		t.Error("Info(nope) returned ok=true")
+	}
+
+	// Recorded domain: cached, persisted and consistent.
+	db.IncomingSecLevel(tr, "d1", SecLevel_TLS_SECURE)
+	st, ok, err := db.Info("d1")
+	if err != nil {
+		t.Fatalf("Info(d1): %v", err)
+	}
+	if !ok {
+		t.Fatal("Info(d1) returned ok=false")
+	}
+	if got := st.Effective().IncomingSecLevel; got != SecLevel_TLS_SECURE {
+		t.Errorf("Info(d1) incoming: got %s, want TLS_SECURE", got)
+	}
+	if !st.InCache() || !st.Persisted() || !st.Consistent() {
+		t.Errorf("Info(d1): cache=%v persisted=%v consistent=%v, want all true",
+			st.InCache(), st.Persisted(), st.Consistent())
+	}
+
+	// On-disk only entry is found and reported as not cached.
+	if err := db.store.Put("d2", &Domain{
+		Name:             "d2",
+		OutgoingSecLevel: SecLevel_TLS_SECURE,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	st, ok, err = db.Info("d2")
+	if err != nil {
+		t.Fatalf("Info(d2): %v", err)
+	}
+	if !ok {
+		t.Fatal("Info(d2) returned ok=false")
+	}
+	if st.InCache() || !st.Persisted() {
+		t.Errorf("Info(d2): cache=%v persisted=%v, want false/true",
+			st.InCache(), st.Persisted())
+	}
+}

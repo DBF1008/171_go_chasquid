@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -36,6 +37,11 @@ Usage:
     Check if the userdb for the given domain is accessible.
   chasquid-util [options] aliases-resolve <address>
     Resolve an address. Talks to the running chasquid.
+  chasquid-util [options] domaininfo-list
+    List all known domaininfo entries. Talks to the running chasquid.
+  chasquid-util [options] domaininfo-get <domain>
+    Show the domaininfo entry for the given domain. Talks to the running
+    chasquid.
   chasquid-util [options] domaininfo-remove <domain>
     Remove domaininfo for the given domain. Talks to the running chasquid.
   chasquid-util [options] print-config
@@ -92,6 +98,8 @@ func main() {
 		"check-userdb":      checkUserDB,
 		"aliases-resolve":   aliasesResolve,
 		"print-config":      printConfig,
+		"domaininfo-list":   domaininfoList,
+		"domaininfo-get":    domaininfoGet,
 		"domaininfo-remove": domaininfoRemove,
 		"dkim-keygen":       dkimKeygen,
 		"dkim-dns":          dkimDNS,
@@ -316,6 +324,71 @@ func domaininfoRemove() {
 	if err != nil {
 		Fatalf("Error removing domaininfo entry: %v", err)
 	}
+}
+
+// chasquid-util domaininfo-list
+func domaininfoList() {
+	conf, err := config.Load(configDir+"/chasquid.conf", "")
+	if err != nil {
+		Fatalf("Error loading config: %v", err)
+	}
+
+	c := localrpc.NewClient(conf.DataDir + "/localrpc-v1")
+	vs, err := c.Call("DomaininfoList")
+	if err != nil {
+		Fatalf("Error listing domaininfo: %v", err)
+	}
+
+	printDomaininfo(vs)
+}
+
+// chasquid-util domaininfo-get <domain>
+func domaininfoGet() {
+	conf, err := config.Load(configDir+"/chasquid.conf", "")
+	if err != nil {
+		Fatalf("Error loading config: %v", err)
+	}
+
+	c := localrpc.NewClient(conf.DataDir + "/localrpc-v1")
+	vs, err := c.Call("DomaininfoGet", "Domain", args["$2"])
+	if err != nil {
+		Fatalf("Error: %v", err)
+	}
+
+	printDomaininfo(vs)
+}
+
+// printDomaininfo renders the columnar url.Values returned by the
+// DomaininfoList and DomaininfoGet RPCs as one line per domain, showing the
+// effective security levels and persistence state, with a note when the
+// running cache and the on-disk store diverge.
+func printDomaininfo(vs url.Values) {
+	for i := range vs["name"] {
+		note := ""
+		switch {
+		case at(vs["cached"], i) != "true":
+			note = "  (NOT IN CACHE)"
+		case at(vs["persisted"], i) != "true":
+			note = "  (NOT ON DISK)"
+		case at(vs["consistent"], i) != "true":
+			note = "  (CACHE/DISK MISMATCH)"
+		}
+		fmt.Printf("%s incoming=%s outgoing=%s persisted=%s%s\n",
+			vs["name"][i],
+			at(vs["incoming"], i),
+			at(vs["outgoing"], i),
+			at(vs["persisted"], i),
+			note)
+	}
+}
+
+// at returns the i-th element of s, or "" if out of range. The RPC response is
+// a set of parallel arrays; this guards against a malformed (short) array.
+func at(s []string, i int) string {
+	if i < len(s) {
+		return s[i]
+	}
+	return ""
 }
 
 // parseArgs parses the command line arguments, and returns a map.
