@@ -97,11 +97,15 @@ type Queue struct {
 	// Give up sending attempts after this long.
 	GiveUpAfter time.Duration
 
-	// Mutex protecting q.
+	// Mutex protecting q and nReserved.
 	mu sync.RWMutex
 
 	// Items in the queue. Map of id -> Item.
 	q map[string]*Item
+
+	// Number of items that have reserved a slot but are not yet in q.
+	// This prevents concurrent Put calls from exceeding MaxItems.
+	nReserved int
 }
 
 // New creates a new Queue instance.
@@ -166,10 +170,19 @@ func (q *Queue) Put(tr *trace.Trace, from string, to []string, data []byte) (str
 	tr = tr.NewChild("Queue.Put", from)
 	defer tr.Finish()
 
-	if nItems := q.Len(); nItems >= q.MaxItems {
+	// Atomically check capacity and reserve a slot.
+	// This prevents concurrent Put calls from all passing the check and
+	// exceeding MaxItems (TOCTOU race).
+	q.mu.Lock()
+	if len(q.q)+q.nReserved >= q.MaxItems {
+		nItems := len(q.q) + q.nReserved
+		q.mu.Unlock()
 		tr.Errorf("queue full (%d items)", nItems)
 		return "", errQueueFull
 	}
+	q.nReserved++
+	q.mu.Unlock()
+
 	putCount.Add(1)
 
 	item := &Item{
@@ -186,6 +199,7 @@ func (q *Queue) Put(tr *trace.Trace, from string, to []string, data []byte) (str
 
 		rcpts, err := q.aliases.Resolve(tr, t)
 		if err != nil {
+			q.releaseSlot()
 			return "", fmt.Errorf("error resolving aliases for %q: %v", t, err)
 		}
 
@@ -208,6 +222,7 @@ func (q *Queue) Put(tr *trace.Trace, from string, to []string, data []byte) (str
 			default:
 				log.Errorf("unknown alias type %v when resolving %q",
 					aliasRcpt.Type, t)
+				q.releaseSlot()
 				return "", tr.Errorf("internal error - unknown alias type")
 			}
 			item.Rcpt = append(item.Rcpt, r)
@@ -217,11 +232,14 @@ func (q *Queue) Put(tr *trace.Trace, from string, to []string, data []byte) (str
 
 	err := item.WriteTo(q.path)
 	if err != nil {
+		q.releaseSlot()
 		return "", tr.Errorf("failed to write item: %v", err)
 	}
 
+	// Commit: add to the map and release the reservation atomically.
 	q.mu.Lock()
 	q.q[item.ID] = item
+	q.nReserved--
 	q.mu.Unlock()
 
 	// Begin to send it right away.
@@ -229,6 +247,14 @@ func (q *Queue) Put(tr *trace.Trace, from string, to []string, data []byte) (str
 
 	tr.Debugf("queued")
 	return item.ID, nil
+}
+
+// releaseSlot releases a previously reserved slot without adding an item.
+// Used when Put fails after reserving a slot.
+func (q *Queue) releaseSlot() {
+	q.mu.Lock()
+	q.nReserved--
+	q.mu.Unlock()
 }
 
 // Remove an item from the queue.

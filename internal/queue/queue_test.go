@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"fmt"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -338,4 +340,251 @@ func mkR(a string, t Recipient_Type, s Recipient_Status, m, o string) *Recipient
 		LastFailureMessage: m,
 		OriginalAddress:    o,
 	}
+}
+
+// blockingCourier is a test courier that blocks delivery until released.
+// This lets tests control when items leave the queue.
+type blockingCourier struct {
+	release chan struct{}
+	wg      sync.WaitGroup
+}
+
+func newBlockingCourier() *blockingCourier {
+	return &blockingCourier{
+		release: make(chan struct{}),
+	}
+}
+
+func (c *blockingCourier) Deliver(from string, to string, data []byte) (error, bool) {
+	<-c.release
+	c.wg.Done()
+	return nil, false
+}
+
+func (c *blockingCourier) Forward(from string, to string, data []byte, servers []string) (error, bool) {
+	<-c.release
+	c.wg.Done()
+	return nil, false
+}
+
+func (c *blockingCourier) Expect(n int) {
+	c.wg.Add(n)
+}
+
+func (c *blockingCourier) Release() {
+	close(c.release)
+}
+
+func (c *blockingCourier) Wait() {
+	c.wg.Wait()
+}
+
+// TestConcurrentPutRespectsMaxItems verifies that under concurrent Put calls,
+// at most MaxItems items are accepted into the queue.
+func TestConcurrentPutRespectsMaxItems(t *testing.T) {
+	dir := testlib.MustTempDir(t)
+	defer testlib.RemoveIfOk(t, dir)
+
+	maxItems := 5
+	nGoroutines := 20
+
+	// Use a blocking courier so items stay in the queue during the test.
+	localC := newBlockingCourier()
+	remoteC := newBlockingCourier()
+
+	q, _ := New(dir, set.NewString("loco"),
+		aliases.NewResolver(allUsersExist),
+		localC, remoteC)
+	q.MaxItems = maxItems
+
+	// All goroutines will synchronize at this barrier before calling Put,
+	// to maximize contention on the capacity check.
+	barrier := make(chan struct{})
+	var successCount atomic.Int32
+	var failCount atomic.Int32
+
+	var wg sync.WaitGroup
+	for i := 0; i < nGoroutines; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			<-barrier // wait for all goroutines to be ready
+
+			tr := trace.New("test", "TestConcurrentPutRespectsMaxItems")
+			defer tr.Finish()
+
+			to := fmt.Sprintf("user%d@loco", idx)
+			_, err := q.Put(tr, "from@loco", []string{to}, []byte("data"))
+			if err == nil {
+				successCount.Add(1)
+			} else if err == errQueueFull {
+				failCount.Add(1)
+			} else {
+				t.Errorf("unexpected error from Put: %v", err)
+			}
+		}(i)
+	}
+
+	// Release all goroutines simultaneously.
+	close(barrier)
+	wg.Wait()
+
+	successes := int(successCount.Load())
+	failures := int(failCount.Load())
+
+	if successes != maxItems {
+		t.Errorf("expected exactly %d successful Puts, got %d (failures: %d)",
+			maxItems, successes, failures)
+	}
+	if successes+failures != nGoroutines {
+		t.Errorf("expected %d total results, got %d", nGoroutines, successes+failures)
+	}
+	if q.Len() != maxItems {
+		t.Errorf("expected queue length %d, got %d", maxItems, q.Len())
+	}
+
+	// Clean up: release the blocking courier and let delivery finish.
+	localC.Expect(successes)
+	localC.Release()
+	localC.Wait()
+	testlib.WaitFor(func() bool { return q.Len() == 0 }, 5*time.Second)
+}
+
+// TestConcurrentPutRejectsWhenFull verifies that concurrent Put calls are all
+// rejected when the queue is already at capacity.
+func TestConcurrentPutRejectsWhenFull(t *testing.T) {
+	dir := testlib.MustTempDir(t)
+	defer testlib.RemoveIfOk(t, dir)
+
+	maxItems := 3
+	q, _ := New(dir, set.NewString("loco"),
+		aliases.NewResolver(allUsersExist),
+		testlib.DumbCourier, testlib.DumbCourier)
+	q.MaxItems = maxItems
+
+	// Fill the queue to capacity using direct insertion (to avoid triggering
+	// delivery goroutines that would drain it).
+	for i := 0; i < maxItems; i++ {
+		item := &Item{
+			Message: Message{
+				ID:   <-newID,
+				From: fmt.Sprintf("from-%d", i),
+				Rcpt: []*Recipient{
+					mkR("to@loco", Recipient_EMAIL, Recipient_PENDING, "", "")},
+				Data: []byte("data"),
+			},
+			CreatedAt: time.Now(),
+		}
+		err := item.WriteTo(q.path)
+		if err != nil {
+			t.Fatalf("failed to write item: %v", err)
+		}
+		q.mu.Lock()
+		q.q[item.ID] = item
+		q.mu.Unlock()
+	}
+
+	if q.Len() != maxItems {
+		t.Fatalf("expected queue length %d, got %d", maxItems, q.Len())
+	}
+
+	// Now try concurrent Puts - all should be rejected.
+	nGoroutines := 10
+	barrier := make(chan struct{})
+	var failCount atomic.Int32
+
+	var wg sync.WaitGroup
+	for i := 0; i < nGoroutines; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			<-barrier
+
+			tr := trace.New("test", "TestConcurrentPutRejectsWhenFull")
+			defer tr.Finish()
+
+			to := fmt.Sprintf("extra%d@loco", idx)
+			_, err := q.Put(tr, "from@loco", []string{to}, []byte("data"))
+			if err == errQueueFull {
+				failCount.Add(1)
+			} else {
+				t.Errorf("expected errQueueFull, got: %v", err)
+			}
+		}(i)
+	}
+
+	close(barrier)
+	wg.Wait()
+
+	if int(failCount.Load()) != nGoroutines {
+		t.Errorf("expected all %d Puts to be rejected, only %d were",
+			nGoroutines, failCount.Load())
+	}
+
+	// Queue length should still be exactly maxItems.
+	if q.Len() != maxItems {
+		t.Errorf("expected queue length %d after rejected Puts, got %d",
+			maxItems, q.Len())
+	}
+}
+
+// TestDeliveryReleasesCapacity verifies that after a successful delivery
+// removes an item from the queue, new Put calls succeed again.
+func TestDeliveryReleasesCapacity(t *testing.T) {
+	dir := testlib.MustTempDir(t)
+	defer testlib.RemoveIfOk(t, dir)
+
+	maxItems := 2
+	localC := testlib.NewTestCourier()
+	remoteC := testlib.NewTestCourier()
+	q, _ := New(dir, set.NewString("loco"),
+		aliases.NewResolver(allUsersExist),
+		localC, remoteC)
+	q.MaxItems = maxItems
+
+	// Fill the queue to capacity via Put.
+	tr := trace.New("test", "TestDeliveryReleasesCapacity")
+	defer tr.Finish()
+
+	localC.Expect(maxItems)
+
+	for i := 0; i < maxItems; i++ {
+		to := fmt.Sprintf("user%d@loco", i)
+		_, err := q.Put(tr, "from@loco", []string{to}, []byte("data"))
+		if err != nil {
+			t.Fatalf("Put %d: %v", i, err)
+		}
+	}
+
+	// Queue should be full now.
+	if q.Len() != maxItems {
+		t.Fatalf("expected queue length %d, got %d", maxItems, q.Len())
+	}
+
+	// This Put should be rejected.
+	_, err := q.Put(tr, "from@loco", []string{"overflow@loco"}, []byte("data"))
+	if err != errQueueFull {
+		t.Errorf("expected errQueueFull, got: %v", err)
+	}
+
+	// Wait for deliveries to complete and items to be removed.
+	localC.Wait()
+	testlib.WaitFor(func() bool { return q.Len() == 0 }, 5*time.Second)
+
+	if q.Len() != 0 {
+		t.Fatalf("expected empty queue after delivery, got %d items", q.Len())
+	}
+
+	// Now Put should succeed again.
+	localC.Expect(1)
+	id, err := q.Put(tr, "from@loco", []string{"new@loco"}, []byte("data"))
+	if err != nil {
+		t.Errorf("Put after delivery should succeed, got: %v", err)
+	}
+	if id == "" {
+		t.Error("expected non-empty ID")
+	}
+
+	localC.Wait()
+	testlib.WaitFor(func() bool { return q.Len() == 0 }, 5*time.Second)
 }
