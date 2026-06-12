@@ -252,6 +252,13 @@ func (s *Server) SetQueueLimits(maxItems uint32, giveUpAfter time.Duration) {
 	}
 }
 
+// StartQueue starts the delivery loops for all items currently in the queue.
+// It must be called after InitQueue and SetQueueLimits, so restored items are
+// evaluated with the correct configured limits (not the built-in defaults).
+func (s *Server) StartQueue() {
+	s.queue.StartSendLoops()
+}
+
 func (s *Server) aliasResolveRPC(tr *trace.Trace, req url.Values) (url.Values, error) {
 	rcpts, err := s.aliasesR.Resolve(tr, req.Get("Address"))
 	if err != nil {

@@ -130,7 +130,10 @@ func New(path string, localDomains *set.String, aliases *aliases.Resolver,
 	return q, err
 }
 
-// Load the queue and launch the sending loops on startup.
+// Load the queue from disk on startup.
+// This only reads items into memory; call StartSendLoops afterwards to begin
+// delivery attempts (typically after configuring queue limits such as
+// GiveUpAfter, so restored items are evaluated with the correct settings).
 func (q *Queue) Load() error {
 	files, err := filepath.Glob(q.path + "/" + itemFilePrefix + "*")
 	if err != nil {
@@ -147,11 +150,26 @@ func (q *Queue) Load() error {
 		q.mu.Lock()
 		q.q[item.ID] = item
 		q.mu.Unlock()
-
-		go item.SendLoop(q)
 	}
 
 	return nil
+}
+
+// StartSendLoops launches the sending loop for every item currently in the
+// queue. It should be called after Load and after queue limits (such as
+// GiveUpAfter) have been configured, so restored items are evaluated with the
+// correct settings.
+func (q *Queue) StartSendLoops() {
+	q.mu.RLock()
+	items := make([]*Item, 0, len(q.q))
+	for _, item := range q.q {
+		items = append(items, item)
+	}
+	q.mu.RUnlock()
+
+	for _, item := range items {
+		go item.SendLoop(q)
+	}
 }
 
 // Len returns the number of elements in the queue.

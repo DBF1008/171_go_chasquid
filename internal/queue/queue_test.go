@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -316,6 +317,7 @@ func TestSerialization(t *testing.T) {
 		aliases.NewResolver(allUsersExist),
 		testlib.DumbCourier, remoteC)
 	q.Load()
+	q.StartSendLoops()
 
 	// Launch the sending loop, expect 1 remote delivery for the item we saved.
 	remoteC.Wait()
@@ -327,6 +329,210 @@ func TestSerialization(t *testing.T) {
 
 	if req.From != "from@loco" || req.To != "to@to" {
 		t.Errorf("wrong email: %v", req)
+	}
+}
+
+// transientFailCourier is a courier that always fails with a transient error
+// and counts delivery attempts.
+type transientFailCourier struct {
+	mu       sync.Mutex
+	attempts int
+}
+
+func (c *transientFailCourier) Deliver(from, to string, data []byte) (error, bool) {
+	c.mu.Lock()
+	c.attempts++
+	c.mu.Unlock()
+	return fmt.Errorf("transient error"), false
+}
+
+func (c *transientFailCourier) Forward(from, to string, data []byte, servers []string) (error, bool) {
+	return fmt.Errorf("transient error"), false
+}
+
+func (c *transientFailCourier) Attempts() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.attempts
+}
+
+// TestLoadRespectsCustomGiveUpAfter verifies that items restored from disk are
+// evaluated against the configured GiveUpAfter, not the hardcoded default
+// (20h). This is a regression test: before the fix, Load started the sending
+// loops before SetQueueLimits could apply the configured value, so items older
+// than the default 20h but younger than the configured limit were immediately
+// expired and DSN'd on restart.
+func TestLoadRespectsCustomGiveUpAfter(t *testing.T) {
+	dir := testlib.MustTempDir(t)
+	defer testlib.RemoveIfOk(t, dir)
+
+	remoteC := &transientFailCourier{}
+
+	// Create a queue and write an item 25h old.
+	// This is older than the default GiveUpAfter (20h), but younger than the
+	// custom one we will configure (48h).
+	_ = os.MkdirAll(dir, 0700)
+
+	item := &Item{
+		Message: Message{
+			ID:   <-newID,
+			From: "from@loco",
+			Rcpt: []*Recipient{
+				mkR("to@remote", Recipient_EMAIL, Recipient_PENDING, "err", "to@remote")},
+			Data: []byte("data"),
+		},
+		CreatedAt: time.Now().Add(-25 * time.Hour),
+	}
+	err := item.WriteTo(dir)
+	if err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+
+	// Create a fresh queue (simulating a restart) and configure it with a
+	// custom GiveUpAfter BEFORE starting the sending loops.
+	q2, _ := New(dir, set.NewString("loco"),
+		aliases.NewResolver(allUsersExist),
+		testlib.DumbCourier, remoteC)
+	q2.GiveUpAfter = 48 * time.Hour
+
+	if err := q2.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	q2.StartSendLoops()
+
+	// The item should survive: 25h < 48h configured GiveUpAfter.
+	// Wait long enough for the SendLoop to start, attempt delivery, and
+	// determine the item is still within the retry window.
+	time.Sleep(500 * time.Millisecond)
+
+	if q2.Len() != 1 {
+		t.Errorf("item was prematurely removed from queue (got len=%d, want 1);"+
+			" likely DSN'd with default GiveUpAfter instead of configured 48h",
+			q2.Len())
+	}
+
+	if remoteC.Attempts() == 0 {
+		t.Error("no delivery attempt made on restored item")
+	}
+}
+
+// TestLoadExpiredItemGetsDSN verifies that items restored from disk that have
+// already exceeded the configured GiveUpAfter are properly expired and DSN'd.
+func TestLoadExpiredItemGetsDSN(t *testing.T) {
+	dir := testlib.MustTempDir(t)
+	defer testlib.RemoveIfOk(t, dir)
+
+	localC := testlib.NewTestCourier()
+	remoteC := &transientFailCourier{}
+
+	// Write an item 50h old, well beyond both the default (20h) and the custom
+	// GiveUpAfter we will set (48h).
+	item := &Item{
+		Message: Message{
+			ID:   <-newID,
+			From: "from@loco",
+			Rcpt: []*Recipient{
+				mkR("to@remote", Recipient_EMAIL, Recipient_PENDING, "err", "to@remote")},
+			Data: []byte("data"),
+		},
+		CreatedAt: time.Now().Add(-50 * time.Hour),
+	}
+	err := item.WriteTo(dir)
+	if err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+
+	// Restart: load with custom GiveUpAfter (48h). Item is 50h old > 48h.
+	q, _ := New(dir, set.NewString("loco"),
+		aliases.NewResolver(allUsersExist),
+		localC, remoteC)
+	q.GiveUpAfter = 48 * time.Hour
+
+	localC.Expect(1) // The DSN to from@loco.
+
+	if err := q.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	q.StartSendLoops()
+	localC.Wait()
+
+	// Verify a DSN was sent to the sender.
+	req := localC.ReqFor["from@loco"]
+	if req == nil {
+		t.Fatal("no DSN sent for expired restored item")
+	}
+	if req.From != "<>" {
+		t.Errorf("DSN should be from <>, got %q", req.From)
+	}
+	if !strings.Contains(string(req.Data), "X-Failed-Recipients: to@remote,") {
+		t.Errorf("DSN missing failed recipients header")
+	}
+
+	// Item should be removed from the queue.
+	testlib.WaitFor(func() bool { return q.Len() == 0 }, 2*time.Second)
+	if q.Len() != 0 {
+		t.Errorf("expired item not removed from queue")
+	}
+}
+
+// TestLoadRestoredItemContinuesDelivery verifies that restored items with
+// pending recipients continue delivery attempts after restart, and that the
+// configured GiveUpAfter is properly applied to determine the retry window.
+func TestLoadRestoredItemContinuesDelivery(t *testing.T) {
+	dir := testlib.MustTempDir(t)
+	defer testlib.RemoveIfOk(t, dir)
+
+	remoteC := testlib.NewTestCourier()
+	remoteC.Expect(1)
+
+	// Write an item created 1h ago with a pending recipient.
+	item := &Item{
+		Message: Message{
+			ID:   <-newID,
+			From: "from@loco",
+			Rcpt: []*Recipient{
+				mkR("to@remote", Recipient_EMAIL, Recipient_PENDING, "", "to@remote")},
+			Data: []byte("data"),
+		},
+		CreatedAt: time.Now().Add(-1 * time.Hour),
+	}
+	err := item.WriteTo(dir)
+	if err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+
+	// Restart with a custom GiveUpAfter (48h).
+	q, _ := New(dir, set.NewString("loco"),
+		aliases.NewResolver(allUsersExist),
+		testlib.DumbCourier, remoteC)
+	q.GiveUpAfter = 48 * time.Hour
+
+	if err := q.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	// Item should be loaded into memory.
+	if q.Len() != 1 {
+		t.Fatalf("expected 1 item after Load, got %d", q.Len())
+	}
+
+	q.StartSendLoops()
+
+	// Delivery should succeed (item is 1h old < 48h GiveUpAfter).
+	remoteC.Wait()
+
+	req := remoteC.ReqFor["to@remote"]
+	if req == nil {
+		t.Fatal("restored item was not delivered")
+	}
+	if req.From != "from@loco" || req.To != "to@remote" {
+		t.Errorf("wrong delivery: %+v", req)
+	}
+
+	// Item should be removed after successful delivery.
+	testlib.WaitFor(func() bool { return q.Len() == 0 }, 2*time.Second)
+	if q.Len() != 0 {
+		t.Errorf("delivered item not removed from queue")
 	}
 }
 

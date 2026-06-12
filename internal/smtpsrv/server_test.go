@@ -659,6 +659,7 @@ func realMain(m *testing.M) int {
 		s.AddAddr(submissionTLSAddr, ModeSubmissionTLS)
 
 		s.InitQueue(tmpDir+"/queue", localC, remoteC)
+		s.StartQueue()
 
 		dinfo, err := domaininfo.New(tmpDir + "/domaininfo")
 		if err != nil {
