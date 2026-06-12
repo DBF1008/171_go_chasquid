@@ -3,7 +3,10 @@ package queue
 import (
 	"bytes"
 	"fmt"
+	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -337,5 +340,160 @@ func mkR(a string, t Recipient_Type, s Recipient_Status, m, o string) *Recipient
 		Status:             s,
 		LastFailureMessage: m,
 		OriginalAddress:    o,
+	}
+}
+
+// blockingCourier blocks every delivery until releaseAll is called. This lets
+// tests hold items in the queue (so it stays at capacity) and then drain them
+// on demand.
+type blockingCourier struct {
+	proceed chan struct{}
+}
+
+func newBlockingCourier() *blockingCourier {
+	return &blockingCourier{proceed: make(chan struct{})}
+}
+
+func (c *blockingCourier) Deliver(from, to string, data []byte) (error, bool) {
+	<-c.proceed
+	return nil, false
+}
+
+func (c *blockingCourier) Forward(from, to string, data []byte, servers []string) (error, bool) {
+	<-c.proceed
+	return nil, false
+}
+
+// releaseAll unblocks all current and future deliveries.
+func (c *blockingCourier) releaseAll() {
+	close(c.proceed)
+}
+
+// countQueueFiles returns the number of item files currently on disk.
+func countQueueFiles(t *testing.T, dir string) int {
+	t.Helper()
+	files, err := filepath.Glob(dir + "/" + itemFilePrefix + "*")
+	if err != nil {
+		t.Fatalf("failed to glob queue files: %v", err)
+	}
+	return len(files)
+}
+
+// TestConcurrentPutRespectsLimit checks that when many envelopes are submitted
+// concurrently, the queue accepts exactly MaxItems and rejects the rest, and
+// that the number of files written to disk never exceeds the limit.
+//
+// This is a regression test for a check-then-insert race: the capacity check
+// used to be separate from (and the disk write used to happen before) the
+// reservation of a slot, so concurrent Puts could collectively write far more
+// than MaxItems files to disk.
+func TestConcurrentPutRespectsLimit(t *testing.T) {
+	dir := testlib.MustTempDir(t)
+	defer testlib.RemoveIfOk(t, dir)
+
+	// Use a blocking courier for both local and remote so accepted items stay
+	// in the queue for the duration of the test.
+	c := newBlockingCourier()
+	q, _ := New(dir, set.NewString(),
+		aliases.NewResolver(allUsersExist),
+		c, c)
+	q.MaxItems = 5
+
+	const concurrency = 50
+	var wg sync.WaitGroup
+	var accepted, rejected atomic.Int64
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			tr := trace.New("test", "concurrent-put")
+			defer tr.Finish()
+			_, err := q.Put(tr, fmt.Sprintf("from-%d", i),
+				[]string{"to"}, []byte("data"))
+			switch err {
+			case nil:
+				accepted.Add(1)
+			case errQueueFull:
+				rejected.Add(1)
+			default:
+				t.Errorf("unexpected Put error: %v", err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	// Exactly MaxItems should have been accepted, the rest rejected.
+	if got, want := accepted.Load(), int64(q.MaxItems); got != want {
+		t.Errorf("accepted %d items, want %d", got, want)
+	}
+	if got, want := rejected.Load(), int64(concurrency-q.MaxItems); got != want {
+		t.Errorf("rejected %d items, want %d", got, want)
+	}
+
+	// The in-memory queue and the on-disk state must both agree with the limit:
+	// the SMTP responses (accepted count) must match what landed on disk.
+	if got := q.Len(); got != q.MaxItems {
+		t.Errorf("queue length is %d, want %d", got, q.MaxItems)
+	}
+	if got := countQueueFiles(t, dir); got != q.MaxItems {
+		t.Errorf("queue has %d files on disk, want %d", got, q.MaxItems)
+	}
+
+	// Drain the queue so the temp dir can be cleaned up.
+	c.releaseAll()
+	if !testlib.WaitFor(func() bool { return q.Len() == 0 }, 5*time.Second) {
+		t.Errorf("queue did not drain, still has %d items", q.Len())
+	}
+}
+
+// TestQueueReleasesCapacityAfterDelivery checks that once items are delivered
+// and removed from the queue, the freed capacity becomes available again for
+// new envelopes.
+func TestQueueReleasesCapacityAfterDelivery(t *testing.T) {
+	dir := testlib.MustTempDir(t)
+	defer testlib.RemoveIfOk(t, dir)
+
+	c := newBlockingCourier()
+	q, _ := New(dir, set.NewString(),
+		aliases.NewResolver(allUsersExist),
+		c, c)
+	q.MaxItems = 3
+
+	tr := trace.New("test", "release-capacity")
+	defer tr.Finish()
+
+	// Fill the queue to capacity. Deliveries block, so the items stay.
+	for i := 0; i < q.MaxItems; i++ {
+		if _, err := q.Put(tr, fmt.Sprintf("from-%d", i),
+			[]string{"to"}, []byte("data")); err != nil {
+			t.Fatalf("Put %d failed: %v", i, err)
+		}
+	}
+	if got := countQueueFiles(t, dir); got != q.MaxItems {
+		t.Fatalf("queue has %d files on disk, want %d", got, q.MaxItems)
+	}
+
+	// The queue is full: the next Put must be rejected.
+	if _, err := q.Put(tr, "overflow", []string{"to"}, []byte("data")); err != errQueueFull {
+		t.Fatalf("Put on full queue: got err %v, want %v", err, errQueueFull)
+	}
+
+	// Let the blocked deliveries complete; the items should be delivered and
+	// removed, freeing up capacity.
+	c.releaseAll()
+	if !testlib.WaitFor(func() bool { return q.Len() == 0 }, 5*time.Second) {
+		t.Fatalf("queue did not drain, still has %d items", q.Len())
+	}
+	if got := countQueueFiles(t, dir); got != 0 {
+		t.Errorf("queue has %d files on disk after drain, want 0", got)
+	}
+
+	// With capacity released, a new Put must succeed.
+	id, err := q.Put(tr, "after", []string{"to"}, []byte("data"))
+	if err != nil {
+		t.Fatalf("Put after drain failed: %v", err)
+	}
+	if id == "" {
+		t.Error("got empty id from successful Put")
 	}
 }

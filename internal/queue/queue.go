@@ -215,20 +215,46 @@ func (q *Queue) Put(tr *trace.Trace, from string, to []string, data []byte) (str
 		}
 	}
 
-	err := item.WriteTo(q.path)
-	if err != nil {
-		return "", tr.Errorf("failed to write item: %v", err)
+	// Atomically check that the queue is not full and reserve a slot for this
+	// item. This must happen before writing to disk: otherwise concurrent Puts
+	// could each pass the best-effort check above and then collectively write
+	// more than MaxItems files to disk before any of them is accounted for.
+	if !q.reserve(item) {
+		tr.Errorf("queue full")
+		return "", errQueueFull
 	}
 
-	q.mu.Lock()
-	q.q[item.ID] = item
-	q.mu.Unlock()
+	err := item.WriteTo(q.path)
+	if err != nil {
+		// The item never made it to disk; release the reserved slot so it does
+		// not count against the queue's capacity.
+		q.mu.Lock()
+		delete(q.q, item.ID)
+		q.mu.Unlock()
+		return "", tr.Errorf("failed to write item: %v", err)
+	}
 
 	// Begin to send it right away.
 	go item.SendLoop(q)
 
 	tr.Debugf("queued")
 	return item.ID, nil
+}
+
+// reserve atomically checks that the queue has room for one more item and, if
+// so, inserts it. It returns false if the queue is already at MaxItems.
+//
+// Holding q.mu across both the capacity check and the insert closes the
+// check-then-insert race: concurrent callers can no longer all observe a
+// non-full queue and then each add an item, pushing the count past the limit.
+func (q *Queue) reserve(item *Item) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if len(q.q) >= q.MaxItems {
+		return false
+	}
+	q.q[item.ID] = item
+	return true
 }
 
 // Remove an item from the queue.
