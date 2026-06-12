@@ -7,6 +7,7 @@ import (
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"flag"
 	"fmt"
@@ -240,6 +241,32 @@ func (s *Server) InitQueue(path string, localC, remoteC courier.Courier) {
 	http.HandleFunc("/debug/queue",
 		func(w http.ResponseWriter, r *http.Request) {
 			_, _ = w.Write([]byte(q.DumpString()))
+		})
+
+	http.HandleFunc("/debug/queue/json",
+		func(w http.ResponseWriter, r *http.Request) {
+			filter := queue.SummaryFilter{
+				Domain: r.URL.Query().Get("domain"),
+				Status: r.URL.Query().Get("status"),
+				From:   r.URL.Query().Get("from"),
+			}
+
+			sortKey := queue.SummarySort(r.URL.Query().Get("sort"))
+			switch sortKey {
+			case queue.SortByAgeAsc, queue.SortByAgeDesc:
+				// Valid sort key.
+			default:
+				sortKey = queue.SortByAgeAsc
+			}
+
+			summary := q.Summary(filter, sortKey)
+
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			enc := json.NewEncoder(w)
+			enc.SetIndent("", "  ")
+			if err := enc.Encode(summary); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+			}
 		})
 }
 

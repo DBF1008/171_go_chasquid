@@ -178,6 +178,7 @@ os hostname <i>{{.Hostname}}</i><br>
 
 <ul>
   <li><a href="/debug/queue">queue</a>
+      <small><a href="/debug/queue/json">(json)</a></small>
   <li>monitoring
     <ul>
       <li><a href="/debug/traces">traces</a>
