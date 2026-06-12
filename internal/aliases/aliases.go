@@ -153,7 +153,18 @@ func NewResolver(userExists existsFn) *Resolver {
 func (v *Resolver) Resolve(tr *trace.Trace, addr string) ([]Recipient, error) {
 	tr = tr.NewChild("Alias.Resolve", addr)
 	defer tr.Finish()
-	return v.resolve(0, addr, tr)
+
+	rcpts, err := v.resolve(0, addr, tr)
+	if err != nil {
+		return nil, err
+	}
+
+	// Resolution can reach the same final recipient through more than one
+	// path: for example, when an address is matched by both an aliases file
+	// entry (including a catch-all) and the resolve hook, or when distinct
+	// aliases expand to a common destination. De-duplicate the final list so
+	// the same target is not delivered to more than once.
+	return dedup(rcpts), nil
 }
 
 // Exists check that the address exists in the database.  It must only be
@@ -317,6 +328,31 @@ func (v *Resolver) resolve(rcount int, addr string, tr *trace.Trace) ([]Recipien
 
 	tr.Debugf("%d| returning %v", rcount, ret)
 	return ret, nil
+}
+
+// dedup removes duplicate recipients from the list, keeping the first
+// occurrence of each one and preserving order.
+//
+// Two recipients are collapsed into one only when delivering to them would be
+// equivalent: same type, same address, and -for forwards- the same "via"
+// route. Entries that differ in type or in their forwarding route are kept, as
+// they represent distinct deliveries; this preserves the necessary delivery
+// type differences while preventing the same target from being sent to twice.
+func dedup(rcpts []Recipient) []Recipient {
+	seen := make(map[string]bool, len(rcpts))
+	deduped := make([]Recipient, 0, len(rcpts))
+	for _, r := range rcpts {
+		// NUL cannot appear in addresses, types or server names, so it is a
+		// safe separator to build an unambiguous key across the fields.
+		key := string(r.Type) + "\x00" + r.Addr + "\x00" +
+			strings.Join(r.Via, "\x00")
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		deduped = append(deduped, r)
+	}
+	return deduped
 }
 
 // Remove drop characters, but only up to the first suffix separator.

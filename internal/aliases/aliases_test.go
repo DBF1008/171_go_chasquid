@@ -810,6 +810,88 @@ func TestHook(t *testing.T) {
 	}
 }
 
+// TestDedupAliases checks that recipients reaching the same destination through
+// different alias paths are de-duplicated, while genuinely distinct deliveries
+// (different type or different forwarding route) are preserved.
+func TestDedupAliases(t *testing.T) {
+	resolver := NewResolver(usersWithXDontExist)
+	resolver.AddDomain("dom")
+	resolver.aliases = map[string][]Recipient{
+		// Two branches that converge on the same final recipient.
+		"a@dom": {email("b@dom"), email("c@dom")},
+		"b@dom": {email("final@remote")},
+		"c@dom": {email("final@remote")},
+
+		// An alias that lists the same address twice.
+		"twice@dom": {email("dup@remote"), email("dup@remote")},
+
+		// Same address under two different delivery types: both must be kept.
+		"typed@dom": {
+			email("keep@remote"),
+			forward("keep@remote", []string{"s1"}),
+		},
+
+		// Forwards: an identical address+route collapses, but a different
+		// route to the same address is kept.
+		"fwd@dom": {
+			forward("f@remote", []string{"s1"}),
+			forward("f@remote", []string{"s1"}),
+			forward("f@remote", []string{"s2"}),
+		},
+
+		// Catch-all that yields the same recipient twice (e.g. an aliases file
+		// listing it redundantly), used for non-existing "x*" users.
+		"*@dom": {email("shared@remote"), email("shared@remote")},
+	}
+
+	cases := Cases{
+		{"a@dom", []Recipient{email("final@remote")}, nil},
+		{"twice@dom", []Recipient{email("dup@remote")}, nil},
+		{"typed@dom", []Recipient{
+			email("keep@remote"),
+			forward("keep@remote", []string{"s1"}),
+		}, nil},
+		{"fwd@dom", []Recipient{
+			forward("f@remote", []string{"s1"}),
+			forward("f@remote", []string{"s2"}),
+		}, nil},
+
+		// xx@dom does not exist, so it goes through the catch-all.
+		{"xx@dom", []Recipient{email("shared@remote")}, nil},
+	}
+	cases.check(t, resolver)
+}
+
+// TestDedupHook checks that recipients produced by the resolve hook are
+// de-duplicated against the aliases file (including the catch-all path) and
+// against themselves. This is the scenario where a catch-all alias and the
+// hook hit at the same time and used to cause duplicate deliveries.
+func TestDedupHook(t *testing.T) {
+	resolver := NewResolver(usersWithXDontExist)
+	resolver.AddDomain("dom")
+	resolver.ResolveHook = "testdata/dedup-hook.sh"
+	resolver.aliases = map[string][]Recipient{
+		// Collides with the hook output for "aliasdup@dom".
+		"aliasdup@dom": {email("ad@remote")},
+
+		// Collides with the hook output for the catch-all lookup "*@dom".
+		"*@dom": {email("shared@remote")},
+	}
+
+	cases := Cases{
+		// The hook itself returns the same recipient twice.
+		{"selfdup@dom", []Recipient{email("sd@remote")}, nil},
+
+		// The aliases file and the hook return the same recipient.
+		{"aliasdup@dom", []Recipient{email("ad@remote")}, nil},
+
+		// Non-existing user: the catch-all alias and the hook (both consulted
+		// for "*@dom") return the same recipient.
+		{"xdup@dom", []Recipient{email("shared@remote")}, nil},
+	}
+	cases.check(t, resolver)
+}
+
 func TestParseForward(t *testing.T) {
 	cases := []struct {
 		raw  string
