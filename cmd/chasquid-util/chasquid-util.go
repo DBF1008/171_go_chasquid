@@ -38,6 +38,10 @@ Usage:
     Resolve an address. Talks to the running chasquid.
   chasquid-util [options] domaininfo-remove <domain>
     Remove domaininfo for the given domain. Talks to the running chasquid.
+  chasquid-util [options] domaininfo-list
+    List all domaininfo entries. Talks to the running chasquid.
+  chasquid-util [options] domaininfo <domain>
+    Show domaininfo for the given domain. Talks to the running chasquid.
   chasquid-util [options] print-config
     Print the current chasquid configuration.
 
@@ -93,6 +97,8 @@ func main() {
 		"aliases-resolve":   aliasesResolve,
 		"print-config":      printConfig,
 		"domaininfo-remove": domaininfoRemove,
+		"domaininfo-list":   domaininfoList,
+		"domaininfo":        domaininfoGet,
 		"dkim-keygen":       dkimKeygen,
 		"dkim-dns":          dkimDNS,
 
@@ -316,6 +322,58 @@ func domaininfoRemove() {
 	if err != nil {
 		Fatalf("Error removing domaininfo entry: %v", err)
 	}
+}
+
+// chasquid-util domaininfo-list
+func domaininfoList() {
+	conf, err := config.Load(configDir+"/chasquid.conf", "")
+	if err != nil {
+		Fatalf("Error loading config: %v", err)
+	}
+
+	c := localrpc.NewClient(conf.DataDir + "/localrpc-v1")
+	vs, err := c.Call("DomaininfoList")
+	if err != nil {
+		Fatalf("Error listing domaininfo: %v", err)
+	}
+
+	nStr := vs.Get("N")
+	n, err := strconv.Atoi(nStr)
+	if err != nil {
+		Fatalf("Error parsing domaininfo list count: %v", err)
+	}
+
+	if n == 0 {
+		fmt.Println("No domaininfo entries.")
+		return
+	}
+
+	fmt.Printf("%-40s  %-16s  %-16s\n", "DOMAIN", "INCOMING", "OUTGOING")
+	for i := 0; i < n; i++ {
+		prefix := strconv.Itoa(i) + "."
+		name := vs.Get("Name." + prefix)
+		incoming := vs.Get("Incoming." + prefix)
+		outgoing := vs.Get("Outgoing." + prefix)
+		fmt.Printf("%-40s  %-16s  %-16s\n", name, incoming, outgoing)
+	}
+}
+
+// chasquid-util domaininfo <domain>
+func domaininfoGet() {
+	conf, err := config.Load(configDir+"/chasquid.conf", "")
+	if err != nil {
+		Fatalf("Error loading config: %v", err)
+	}
+
+	c := localrpc.NewClient(conf.DataDir + "/localrpc-v1")
+	vs, err := c.Call("DomaininfoGet", "Domain", args["$2"])
+	if err != nil {
+		Fatalf("Error getting domaininfo: %v", err)
+	}
+
+	fmt.Printf("Domain:          %s\n", vs.Get("Name"))
+	fmt.Printf("Incoming level:  %s\n", vs.Get("Incoming"))
+	fmt.Printf("Outgoing level:  %s\n", vs.Get("Outgoing"))
 }
 
 // parseArgs parses the command line arguments, and returns a map.

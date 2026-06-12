@@ -204,3 +204,116 @@ func TestDirectoryErrors(t *testing.T) {
 		t.Errorf("got %v, expected %v", err, os.ErrNotExist)
 	}
 }
+
+func TestList(t *testing.T) {
+	dir := testlib.MustTempDir(t)
+	defer testlib.RemoveIfOk(t, dir)
+	db, err := New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := trace.New("test", "list")
+	defer tr.Finish()
+
+	// Empty database should return an empty list.
+	if got := db.List(); len(got) != 0 {
+		t.Errorf("empty db: got %d entries, expected 0", len(got))
+	}
+
+	// Add some domains with different security levels.
+	db.IncomingSecLevel(tr, "beta.com", SecLevel_TLS_SECURE)
+	db.OutgoingSecLevel(tr, "beta.com", SecLevel_TLS_CLIENT)
+	db.IncomingSecLevel(tr, "alpha.com", SecLevel_TLS_INSECURE)
+	db.OutgoingSecLevel(tr, "alpha.com", SecLevel_TLS_SECURE)
+
+	list := db.List()
+	if len(list) != 2 {
+		t.Fatalf("got %d entries, expected 2", len(list))
+	}
+
+	// List should be sorted by name.
+	if list[0].Name != "alpha.com" {
+		t.Errorf("list[0].Name = %q, expected alpha.com", list[0].Name)
+	}
+	if list[1].Name != "beta.com" {
+		t.Errorf("list[1].Name = %q, expected beta.com", list[1].Name)
+	}
+
+	// Verify the returned entries have correct security levels.
+	if list[0].IncomingSecLevel != SecLevel_TLS_INSECURE {
+		t.Errorf("alpha incoming = %v, expected TLS_INSECURE",
+			list[0].IncomingSecLevel)
+	}
+	if list[0].OutgoingSecLevel != SecLevel_TLS_SECURE {
+		t.Errorf("alpha outgoing = %v, expected TLS_SECURE",
+			list[0].OutgoingSecLevel)
+	}
+	if list[1].IncomingSecLevel != SecLevel_TLS_SECURE {
+		t.Errorf("beta incoming = %v, expected TLS_SECURE",
+			list[1].IncomingSecLevel)
+	}
+	if list[1].OutgoingSecLevel != SecLevel_TLS_CLIENT {
+		t.Errorf("beta outgoing = %v, expected TLS_CLIENT",
+			list[1].OutgoingSecLevel)
+	}
+
+	// Returned entries should be copies, not references to internal state.
+	list[0].IncomingSecLevel = SecLevel_PLAIN
+	if got, _ := db.Get("alpha.com"); got.IncomingSecLevel != SecLevel_TLS_INSECURE {
+		t.Errorf("modifying list entry changed internal state")
+	}
+}
+
+func TestGet(t *testing.T) {
+	dir := testlib.MustTempDir(t)
+	defer testlib.RemoveIfOk(t, dir)
+	db, err := New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := trace.New("test", "get")
+	defer tr.Finish()
+
+	// Non-existent domain should return (nil, false).
+	d, ok := db.Get("nonexistent.com")
+	if ok || d != nil {
+		t.Errorf("Get(nonexistent) = (%v, %v), expected (nil, false)", d, ok)
+	}
+
+	// Add a domain and verify it can be retrieved.
+	db.IncomingSecLevel(tr, "example.com", SecLevel_TLS_SECURE)
+	db.OutgoingSecLevel(tr, "example.com", SecLevel_TLS_INSECURE)
+
+	d, ok = db.Get("example.com")
+	if !ok {
+		t.Fatal("Get(example.com) returned false")
+	}
+	if d.Name != "example.com" {
+		t.Errorf("d.Name = %q, expected example.com", d.Name)
+	}
+	if d.IncomingSecLevel != SecLevel_TLS_SECURE {
+		t.Errorf("incoming = %v, expected TLS_SECURE", d.IncomingSecLevel)
+	}
+	if d.OutgoingSecLevel != SecLevel_TLS_INSECURE {
+		t.Errorf("outgoing = %v, expected TLS_INSECURE", d.OutgoingSecLevel)
+	}
+
+	// Returned entry should be a copy, not a reference to internal state.
+	d.IncomingSecLevel = SecLevel_PLAIN
+	if got, _ := db.Get("example.com"); got.IncomingSecLevel != SecLevel_TLS_SECURE {
+		t.Errorf("modifying returned entry changed internal state")
+	}
+
+	// After Clear, Get should still return the entry but with PLAIN levels.
+	db.Clear(tr, "example.com")
+	d, ok = db.Get("example.com")
+	if !ok {
+		t.Fatal("Get(example.com) returned false after Clear")
+	}
+	if d.IncomingSecLevel != SecLevel_PLAIN {
+		t.Errorf("incoming after clear = %v, expected PLAIN", d.IncomingSecLevel)
+	}
+	if d.OutgoingSecLevel != SecLevel_PLAIN {
+		t.Errorf("outgoing after clear = %v, expected PLAIN", d.OutgoingSecLevel)
+	}
+}

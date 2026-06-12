@@ -45,6 +45,12 @@ wait_until_ready 1025
 wait_until_ready 2025
 wait_until_ready 9053
 
+# Before any mail exchange, domaininfo-list on A should be empty.
+CONFDIR=A chasquid-util domaininfo-list > .dinfo-list-empty.log 2>&1
+if ! grep -q 'No domaininfo entries' .dinfo-list-empty.log; then
+	fail "Expected empty domaininfo list before mail exchange"
+fi
+
 smtpc userB@srv-B < content
 
 wait_for_file .mail/userb@srv-b
@@ -62,6 +68,24 @@ then
 	fail "B is missing the domaininfo for srv-a"
 fi
 
+# domaininfo-list on A should show srv-b with correct security levels.
+CONFDIR=A chasquid-util domaininfo-list > .dinfo-list-A.log 2>&1
+if ! grep -q 'srv-b.*TLS_SECURE' .dinfo-list-A.log; then
+	fail "domaininfo-list on A missing srv-b or wrong security level"
+fi
+
+# domaininfo detail query on A for srv-b should show correct levels.
+CONFDIR=A chasquid-util domaininfo srv-b > .dinfo-detail-b.log 2>&1
+if ! grep -q 'Outgoing level:.*TLS_SECURE' .dinfo-detail-b.log; then
+	fail "domaininfo detail for srv-b missing TLS_SECURE outgoing level"
+fi
+
+# domaininfo detail query on B for srv-a should show correct levels.
+CONFDIR=B chasquid-util domaininfo srv-a > .dinfo-detail-a.log 2>&1
+if ! grep -q 'Incoming level:.*TLS_CLIENT' .dinfo-detail-a.log; then
+	fail "domaininfo detail for srv-a missing TLS_CLIENT incoming level"
+fi
+
 # In A, remove domaininfo data about srv-B.
 # Check that it was cleared successfully.
 CONFDIR=A chasquid-util domaininfo-remove srv-b
@@ -70,10 +94,30 @@ then
 	fail "Error clearing A's domaininfo about srv-b"
 fi
 
+# After clearing, domaininfo-list on A should still show srv-b but with PLAIN.
+CONFDIR=A chasquid-util domaininfo-list > .dinfo-list-after-clear.log 2>&1
+if ! grep -q 'srv-b.*PLAIN.*PLAIN' .dinfo-list-after-clear.log; then
+	fail "domaininfo-list after clear: srv-b should show PLAIN/PLAIN"
+fi
+
+# domaininfo detail after clear should show PLAIN levels.
+CONFDIR=A chasquid-util domaininfo srv-b > .dinfo-detail-after-clear.log 2>&1
+if ! grep -q 'Incoming level:.*PLAIN' .dinfo-detail-after-clear.log; then
+	fail "domaininfo detail after clear: incoming should be PLAIN"
+fi
+if ! grep -q 'Outgoing level:.*PLAIN' .dinfo-detail-after-clear.log; then
+	fail "domaininfo detail after clear: outgoing should be PLAIN"
+fi
+
 # While at it, check that a domaininfo-remove for an unknown domain results in
 # an error.
 if CONFDIR=A chasquid-util domaininfo-remove srv-X > .cdu-di-r-x.log 2>&1; then
 	fail "Expected error on chasquid-util domaininfo-remove srv-X"
+fi
+
+# Check that domaininfo detail for an unknown domain also results in an error.
+if CONFDIR=A chasquid-util domaininfo srv-X > .cdu-di-g-x.log 2>&1; then
+	fail "Expected error on chasquid-util domaininfo srv-X"
 fi
 
 success

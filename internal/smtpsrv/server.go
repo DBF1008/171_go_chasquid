@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -275,6 +276,32 @@ func (s *Server) dinfoClearRPC(tr *trace.Trace, req url.Values) (url.Values, err
 	return nil, nil
 }
 
+func (s *Server) dinfoListRPC(tr *trace.Trace, req url.Values) (url.Values, error) {
+	domains := s.dinfo.List()
+	v := url.Values{}
+	v.Set("N", strconv.Itoa(len(domains)))
+	for i, d := range domains {
+		prefix := strconv.Itoa(i) + "."
+		v.Set("Name."+prefix, d.Name)
+		v.Set("Incoming."+prefix, d.IncomingSecLevel.String())
+		v.Set("Outgoing."+prefix, d.OutgoingSecLevel.String())
+	}
+	return v, nil
+}
+
+func (s *Server) dinfoGetRPC(tr *trace.Trace, req url.Values) (url.Values, error) {
+	domain := req.Get("Domain")
+	d, exists := s.dinfo.Get(domain)
+	if !exists {
+		return nil, fmt.Errorf("does not exist")
+	}
+	v := url.Values{}
+	v.Set("Name", d.Name)
+	v.Set("Incoming", d.IncomingSecLevel.String())
+	v.Set("Outgoing", d.OutgoingSecLevel.String())
+	return v, nil
+}
+
 // periodicallyReload some of the server's information that can be changed
 // without the server knowing, such as aliases and the user databases.
 func (s *Server) periodicallyReload() {
@@ -314,6 +341,8 @@ func (s *Server) ListenAndServe() {
 
 	localrpc.DefaultServer.Register("AliasResolve", s.aliasResolveRPC)
 	localrpc.DefaultServer.Register("DomaininfoClear", s.dinfoClearRPC)
+	localrpc.DefaultServer.Register("DomaininfoList", s.dinfoListRPC)
+	localrpc.DefaultServer.Register("DomaininfoGet", s.dinfoGetRPC)
 
 	go s.periodicallyReload()
 

@@ -4,6 +4,7 @@ package domaininfo
 
 import (
 	"fmt"
+	"sort"
 	"sync"
 
 	"blitiri.com.ar/go/chasquid/internal/protoio"
@@ -181,4 +182,39 @@ func (db *DB) Clear(tr *trace.Trace, domain string) bool {
 	db.write(tr, d)
 	tr.Printf("set to plain")
 	return true
+}
+
+// List returns all domains in the database, sorted by name.
+// Each returned Domain is a copy, safe to use without holding the lock.
+func (db *DB) List() []*Domain {
+	db.Lock()
+	defer db.Unlock()
+
+	result := make([]*Domain, 0, len(db.info))
+	for _, d := range db.info {
+		cp := *d
+		result = append(result, &cp)
+	}
+
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Name < result[j].Name
+	})
+
+	return result
+}
+
+// Get returns the Domain entry for the given domain name.
+// Returns (nil, false) if the domain does not exist in the database.
+// The returned Domain is a copy, safe to use without holding the lock.
+func (db *DB) Get(domain string) (*Domain, bool) {
+	db.Lock()
+	defer db.Unlock()
+
+	d, exists := db.info[domain]
+	if !exists {
+		return nil, false
+	}
+
+	cp := *d
+	return &cp, true
 }

@@ -1,0 +1,57 @@
+# domaininfo-list: empty result.
+server unix_listen .data/localrpc-v1
+c = ./chasquid-util -C=.config domaininfo-list
+
+server <- DomaininfoList
+server -> 200 N=0
+
+c <- No domaininfo entries.
+c wait 0
+
+
+# domaininfo-list: with entries.
+server unix_listen .data/localrpc-v1
+c = ./chasquid-util -C=.config domaininfo-list
+
+server <- DomaininfoList
+server -> 200 N=2&Name.0=alpha.com&Incoming.0=PLAIN&Outgoing.0=TLS_SECURE&Name.1=beta.org&Incoming.1=TLS_CLIENT&Outgoing.1=TLS_SECURE
+
+c <- DOMAIN                                      INCOMING          OUTGOING
+c <- alpha.com                                   PLAIN             TLS_SECURE
+c <- beta.org                                    TLS_CLIENT        TLS_SECURE
+c wait 0
+
+
+# domaininfo-list: server error.
+server unix_listen .data/localrpc-v1
+c = ./chasquid-util -C=.config domaininfo-list
+
+server <- DomaininfoList
+server -> 500 server is unavailable
+
+c <- Error listing domaininfo: server is unavailable
+c wait 1
+
+
+# domaininfo (detail): success.
+server unix_listen .data/localrpc-v1
+c = ./chasquid-util -C=.config domaininfo domain.com
+
+server <- DomaininfoGet Domain=domain.com
+server -> 200 Name=domain.com&Incoming=TLS_SECURE&Outgoing=TLS_CLIENT
+
+c <- Domain:          domain.com
+c <- Incoming level:  TLS_SECURE
+c <- Outgoing level:  TLS_CLIENT
+c wait 0
+
+
+# domaininfo (detail): not found.
+server unix_listen .data/localrpc-v1
+c = ./chasquid-util -C=.config domaininfo nonexistent.com
+
+server <- DomaininfoGet Domain=nonexistent.com
+server -> 500 does not exist
+
+c <- Error getting domaininfo: does not exist
+c wait 1
